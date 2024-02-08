@@ -42,6 +42,10 @@
 #include <sys/socket.h>
 #include <dirent.h>
 
+#include <hamlib/config.h>
+#include <hamlib/rig.h>
+
+#include "rigctl_parse.h"
 #include "connector.h"
 #include "spool.h"
 #include "vara.h"
@@ -51,6 +55,7 @@
 
 // temporary global variable to enable sockets closure
 rhizo_conn *tmp_conn = NULL;
+RIG *radio;
 
 void finish(int s){
     fprintf(stderr, "\nExiting...\n");
@@ -116,6 +121,7 @@ bool initialize_connector(rhizo_conn *connector){
     return true;
 }
 
+
 int main (int argc, char *argv[])
 {
     rhizo_conn connector;
@@ -126,16 +132,25 @@ int main (int argc, char *argv[])
     // Catch Ctrl+C
     signal (SIGINT,finish);
 
-    fprintf(stderr, "Rhizomatica's HF Connector version 0.3 by Rafael Diniz -  rafael (AT) rhizomatica (DOT) org\n");
+    // hamlib stuff
+    rig_model_t radio_model = RIG_MODEL_DUMMY;
+    ptt_type_t ptt_type = RIG_PTT_NONE;
+    dcd_type_t dcd_type = RIG_DCD_NONE;
+    int vfo_opt = 0;
+
+    rig_set_debug(5);
+
+
+    fprintf(stderr, "Rhizomatica's HF Connector version 0.4 by Rafael Diniz -  rafael (AT) rhizomatica (DOT) org\n");
     fprintf(stderr, "License: GPLv3+\n\n");
 
-    if (argc < 7)
+    if (argc < 2)
     {
     manual:
         fprintf(stderr, "Usage modes: \n%s -r radio_modem_type -i input_spool_directory -o output_spool_directory -c callsign -d remote_callsign -a tnc_ip_address -p tcp_base_port\n", argv[0]);
         fprintf(stderr, "%s -h\n", argv[0]);
         fprintf(stderr, "\nOptions:\n");
-        fprintf(stderr, " -r [ardop,vara]           Choose modem/radio type.\n");
+        fprintf(stderr, " -x [mercury,ardop,vara]           Choose modem/radio type.\n");
         fprintf(stderr, " -i input_spool_directory    Input spool directory (Messages to send).\n");
         fprintf(stderr, " -o output_spool_directory    Output spool directory (Received messages).\n");
         fprintf(stderr, " -c callsign                        Station Callsign (Eg: PU2HFF).\n");
@@ -144,31 +159,32 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -p tcp_base_port              TCP base port of the TNC. For VARA and ARDOP ports tcp_base_port and tcp_base_port+1 are used,\n");
         fprintf(stderr, " -t timeout                 Time to wait before disconnect when idling.\n");
         fprintf(stderr, " -f features                Enable/Disable features. Supported features: ofdm, noofdm (ARDOP ONLY).\n");
-        fprintf(stderr, " -s serial_device           Set the serial device file path for keying the radio (VARA ONLY).\n");
-        fprintf(stderr, " -b [icom,ubitx]            Sets radio type (supported: icom or ubitx)\n");
+        fprintf(stderr, " -m [radio_model]           Sets HAMLIB radio model\n");
+        fprintf(stderr, " -r [radio_address]         Sets HAMLIB radio device file or ip:port address\n");
+        fprintf(stderr, " -l                         List HAMLIB supported radio models\n");
+
         fprintf(stderr, " -h                          Prints this help.\n");
         exit(EXIT_FAILURE);
     }
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:i:o:c:d:p:a:t:f:s:b:")) != -1)
+    while ((opt = getopt(argc, argv, "hr:i:o:c:d:p:a:t:f:s:x:m:l")) != -1)
     {
         switch (opt)
         {
         case 'h':
             goto manual;
             break;
+        case 'l':
+            list_models();
+            exit(EXIT_SUCCESS);
+            break;
         case 'c':
             strcpy(connector.call_sign, optarg);
             break;
         case 'd':
             strcpy(connector.remote_call_sign, optarg);
-            break;
-        case 'b':
-            // icom is the default...
-            if (!strcmp(optarg,"ubitx"))
-                connector.radio_type = RADIO_TYPE_UBITX;
             break;
         case 't':
             connector.timeout = atoi(optarg);
@@ -179,7 +195,7 @@ int main (int argc, char *argv[])
         case 'a':
             strcpy(connector.ip_address, optarg);
             break;
-        case 'r':
+        case 'x':
             strcpy(connector.modem_type, optarg);
             break;
         case 'i':
@@ -204,15 +220,25 @@ int main (int argc, char *argv[])
             else
                 connector.ofdm_mode = true;
             break;
-        case 's':
+        case 'r':
             connector.serial_keying = true;
             strcpy(connector.serial_path, optarg);
+            break;
+        case 'm':
+            connector.radio_type =  atoi(optarg);
             break;
         default:
             goto manual;
         }
     }
 
+    radio = rig_init(connector.radio_type);
+    if (!radio)
+    {
+        fprintf(stderr, "Unknown rig num %u, or initialization error.\n", connector.radio_type);
+        fprintf(stderr, "Please check with -l option.\n");
+        exit(2);
+    }
     pthread_t tid[3];
 
     pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
