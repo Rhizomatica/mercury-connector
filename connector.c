@@ -85,15 +85,25 @@ void *modem_thread(void *conn)
 {
     rhizo_conn *connector = (rhizo_conn *) conn;
 
-    if (!strcmp("vara", connector->modem_type)){
+#if 0
+    if (!strcmp("mercury", connector->modem_type))
+    {
+        initialize_modem_mercury(connector);
+    }
+#endif
+
+    if (!strcmp("vara", connector->modem_type))
+    {
         initialize_modem_vara(connector);
     }
 
-    if (!strcmp("ardop", connector->modem_type)){
+    if (!strcmp("ardop", connector->modem_type))
+    {
         initialize_modem_ardop(connector);
     }
 
-    if (!strcmp("dstar", connector->modem_type)){
+    if (!strcmp("dstar", connector->modem_type))
+    {
         initialize_modem_dstar(connector);
     }
 
@@ -106,10 +116,11 @@ bool initialize_connector(rhizo_conn *connector){
     initialize_buffer(&connector->out_buffer, 26); // 64MB
     pthread_mutex_init(&connector->msg_path_queue_mutex, NULL);
 
+    connector->serial_path[0] = 0;
     connector->connected = false;
     connector->waiting_for_connection = false;
     connector->serial_keying = false;
-    connector->radio_type = RADIO_TYPE_ICOM;
+    connector->radio_type = 0;
     connector->tcp_ret_ok = true;
     connector->serial_fd = -1;
     connector->msg_path_queue_size = 0;
@@ -133,15 +144,17 @@ int main (int argc, char *argv[])
     signal (SIGINT,finish);
 
     // hamlib stuff
-    rig_model_t radio_model = RIG_MODEL_DUMMY;
+#if 0 // lets just use defaults for now...
     ptt_type_t ptt_type = RIG_PTT_NONE;
     dcd_type_t dcd_type = RIG_DCD_NONE;
-    int vfo_opt = 0;
+#endif
 
-    rig_set_debug(5);
+    // unset this after done
+    rig_set_debug(RIG_DEBUG_TRACE);
 
 
-    fprintf(stderr, "Rhizomatica's HF Connector version 0.4 by Rafael Diniz -  rafael (AT) rhizomatica (DOT) org\n");
+    fprintf(stderr, "Mercury Connector version 0.5\n");
+    fprintf(stderr, " by Rafael Diniz - rafael (AT) rhizomatica (DOT) org\n");
     fprintf(stderr, "License: GPLv3+\n\n");
 
     if (argc < 2)
@@ -236,9 +249,81 @@ int main (int argc, char *argv[])
     if (!radio)
     {
         fprintf(stderr, "Unknown rig num %u, or initialization error.\n", connector.radio_type);
-        fprintf(stderr, "Please check with -l option.\n");
+        fprintf(stderr, "Please check available radios with -l option.\n");
         exit(2);
     }
+
+    if (connector.serial_path[0])
+        strncpy(radio->state.rigport.pathname, connector.serial_path, HAMLIB_FILPATHLEN - 1);
+
+    int ret;
+
+    ret = rig_open(radio);
+    if (ret != RIG_OK)
+    {
+        fprintf(stderr, "rig_open: error = %s %s \n", connector.serial_path, rigerror(ret));
+        return EXIT_FAILURE;
+    }
+
+    if (radio->caps->rig_model == RIG_MODEL_NETRIGCTL)
+    {
+        /* We automatically detect if we need to be in vfo mode or not */
+        int rigctld_vfo_opt = netrigctl_get_vfo_mode(radio);
+        int vfo_opt = radio->state.vfo_opt = rigctld_vfo_opt;
+        rig_debug(RIG_DEBUG_TRACE, "%s vfo_opt=%d\n", __func__, vfo_opt);
+    }
+
+    vfo_t vfo = 0;
+    ret = rig_get_vfo(radio, &vfo);
+    if (ret == RIG_OK)
+        fprintf(stderr, "Current VFO: %d\n", vfo);
+    else
+        fprintf(stderr, "Error reading VFO,\n");
+
+    freq_t freq;
+    ret = rig_get_freq(radio, RIG_VFO_CURR, &freq);
+
+    if (ret == RIG_OK )
+    {
+        fprintf(stderr, "rig_get_freq: freq = %f\n", freq);
+    } else
+    {
+        fprintf(stderr, "rig_get_freq: error =  %s \n", rigerror(ret));
+    }
+
+    rmode_t rmode;          /* radio mode of operation */
+    pbwidth_t width;
+    ret = rig_get_mode(radio, RIG_VFO_CURR, &rmode, &width);
+
+    if (ret == RIG_OK )
+    {
+        fprintf(stderr, "rig_get_mode: mode = %lu \n", rmode);
+    } else
+    {
+        fprintf(stderr, "rig_get_mode: error =  %s \n", rigerror(ret));
+    }
+
+#if 0
+    ret = rig_set_mode(radio, RIG_VFO_CURR, RIG_MODE_LSB, RIG_PASSBAND_NORMAL);
+    if (ret != RIG_OK )
+    {
+       fprintf(stderr, "rig_set_mode: error = %s \n", rigerror(ret));
+    }
+
+    ret = rig_set_ptt(radio, RIG_VFO_CURR, RIG_PTT_ON ); // should we use RIG_VFO_A ?
+
+    if (ret != RIG_OK )
+    {
+        fprintf(stderr, "rig_set_ptt: error = %s \n", rigerror(ret));
+    }
+
+    ret = rig_set_ptt(radio, RIG_VFO_CURR, RIG_PTT_OFF ); /* phew ! */
+    if (ret != RIG_OK )
+    {
+        fprintf(stderr, "rig_set_ptt: error = %s \n", rigerror(ret));
+    }
+#endif
+
     pthread_t tid[3];
 
     pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
@@ -253,6 +338,9 @@ int main (int argc, char *argv[])
         // we cant guarantee nothing about data passed to tnc... pthread_cancel? select?
         // spool needs to re-read the input directory...
     }
+
+    rig_close(radio);
+    rig_cleanup(radio);
 
     return EXIT_SUCCESS;
 }
