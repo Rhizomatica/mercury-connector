@@ -49,7 +49,6 @@
 #include "connector.h"
 #include "spool.h"
 #include "vara.h"
-#include "dstar.h"
 #include "ardop.h"
 #include "serial.h"
 
@@ -100,11 +99,6 @@ void *modem_thread(void *conn)
     if (!strcmp("ardop", connector->modem_type))
     {
         initialize_modem_ardop(connector);
-    }
-
-    if (!strcmp("dstar", connector->modem_type))
-    {
-        initialize_modem_dstar(connector);
     }
 
     return NULL;
