@@ -136,59 +136,74 @@ void *vara_control_worker_thread_rx(void *conn)
     while(connector->tcp_ret_ok){
         connector->tcp_ret_ok &= tcp_read(connector->control_socket, &rcv_byte, 1);
 
-        if (rcv_byte == '\r'){
+        if (rcv_byte == '\r')
+        {
             buffer[counter] = 0;
             counter = 0;
             new_cmd = true;
         }
-        else{
+        else
+        {
             buffer[counter] = rcv_byte;
             counter++;
             new_cmd = false;
         }
 
-        if (new_cmd){
-            if (!strcmp((char *) buffer, "DISCONNECTED")){
+        if (new_cmd)
+        {
+            if (!strcmp((char *) buffer, "DISCONNECTED"))
+            {
                 fprintf(stderr, "TNC: %s\n", buffer);
                 connector->connected = false;
                 connector->waiting_for_connection = false;
-            } else
-            // other commands here
-            if (!memcmp(buffer, "CONNECTED", strlen("CONNECTED"))){
-                fprintf(stderr, "TNC: %s\n", buffer);
-                connector->connected = true;
-                connector->waiting_for_connection = false;
-            } else
-            if (!memcmp(buffer, "BUFFER", strlen("BUFFER"))){
-                uint32_t buf_size;
-                sscanf( (char *) buffer, "BUFFER %u", &buf_size);
-                fprintf(stderr, "BUFFER: %u\n", buf_size);
-
-                if (buf_size != 0)
-                    connector->timeout_counter = 0;
-
-                // our delete messages mechanism
-                if (buf_size == 0 &&
-                    ring_buffer_count_bytes(&connector->in_buffer.buf) == 0 &&
-                    connector->connected == true){
-
-                    fprintf(stderr, "Messages successfully sent. Erasing messages...\n");
-                    remove_all_msg_path_queue(connector);
-
-                }
-            } else
+            }
+            else
             {
-                if (connector->serial_keying == true)
+            // other commands here
+                if (!memcmp(buffer, "CONNECTED", strlen("CONNECTED")))
                 {
-                    if (!memcmp(buffer, "PTT ON", strlen("PTT ON")))
+                    fprintf(stderr, "TNC: %s\n", buffer);
+                    connector->connected = true;
+                    connector->waiting_for_connection = false;
+                }
+                else
+                {
+                    if (!memcmp(buffer, "BUFFER", strlen("BUFFER")))
                     {
-                        key_on(connector->serial_fd, connector->radio_type);
+                        uint32_t buf_size;
+                        sscanf( (char *) buffer, "BUFFER %u", &buf_size);
+                        fprintf(stderr, "BUFFER: %u\n", buf_size);
+
+                        if (buf_size != 0)
+                            connector->timeout_counter = 0;
+
+                        // our delete messages mechanism
+                        if (buf_size == 0 &&
+                            ring_buffer_count_bytes(&connector->in_buffer.buf) == 0 &&
+                            connector->connected == true)
+                        {
+
+                            fprintf(stderr, "Messages successfully sent. Erasing messages...\n");
+                            remove_all_msg_path_queue(connector);
+
+                        }
                     }
-                    if (!memcmp(buffer, "PTT OFF", strlen("PTT OFF"))){
-                        key_off(connector->serial_fd, connector->radio_type);
+                    else
+                    {
+                        if (connector->serial_keying == true)
+                        {
+                            if (!memcmp(buffer, "PTT ON", strlen("PTT ON")))
+                            {
+                                key_on(connector->serial_fd, connector->radio_type);
+                            }
+                            if (!memcmp(buffer, "PTT OFF", strlen("PTT OFF")))
+                            {
+                                key_off(connector->serial_fd, connector->radio_type);
+                            }
+                        }
+                        fprintf(stderr, "%s\n", buffer);
                     }
                 }
-                fprintf(stderr, "%s\n", buffer);
             }
         }
     }
@@ -219,14 +234,15 @@ void *vara_control_worker_thread_tx(void *conn)
     connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *) buffer, strlen(buffer));
 
     // 1Hz function
-    while(connector->tcp_ret_ok){
-
+    while(connector->tcp_ret_ok)
+    {
 
         // Logic to start a connection
         // condition for connection: no connection AND something to transmitt AND we did not issue a CONNECT recently
         if (connector->connected == false &&
             ring_buffer_count_bytes(&connector->in_buffer.buf) > 0 &&
-            !connector->waiting_for_connection){
+            !connector->waiting_for_connection)
+        {
 
             // \todo try to add some entropy in order to avoid on air clashes
             memset(buffer,0,sizeof(buffer));
@@ -241,11 +257,13 @@ void *vara_control_worker_thread_tx(void *conn)
 
         // Logic to disconnect on timeout
         if (connector->timeout_counter >= connector->timeout &&
-            connector->connected == true){
+            connector->connected == true)
+        {
 
             connector->connected = false;
 
-            while (connector->safe_state != 2){ // this means we have both data threads in the safe zone
+            while (connector->safe_state != 2)
+            { // this means we have both data threads in the safe zone
                 sched_yield();
             }
             fprintf(stderr, "DISCONNECTING BY TIMEOUT...\n");

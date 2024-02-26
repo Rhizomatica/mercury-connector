@@ -286,7 +286,8 @@ int main (int argc, char *argv[])
     if (ret == RIG_OK )
     {
         fprintf(stderr, "rig_get_freq: freq = %f\n", freq);
-    } else
+    }
+    else
     {
         fprintf(stderr, "rig_get_freq: error =  %s \n", rigerror(ret));
     }
@@ -298,7 +299,8 @@ int main (int argc, char *argv[])
     if (ret == RIG_OK )
     {
         fprintf(stderr, "rig_get_mode: mode = %lu \n", rmode);
-    } else
+    }
+    else
     {
         fprintf(stderr, "rig_get_mode: error =  %s \n", rigerror(ret));
     }
