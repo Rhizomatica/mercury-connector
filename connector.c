@@ -117,7 +117,7 @@ bool initialize_connector(rhizo_conn *connector){
     connector->connected = false;
     connector->waiting_for_connection = false;
     connector->serial_keying = false;
-    connector->radio_type = 0;
+    connector->radio_type = -1;
     connector->tcp_ret_ok = true;
     connector->serial_fd = -1;
     connector->msg_path_queue_size = 0;
@@ -233,19 +233,23 @@ int main (int argc, char *argv[])
                 connector.ofdm_mode = true;
             break;
         case 'r':
-            connector.serial_keying = true;
             strcpy(connector.serial_path, optarg);
             break;
         case 'm':
             connector.radio_type = atoi(optarg);
             break;
-       case 's':
+        case 's':
             connector.radio_type = RADIO_TYPE_SHM;
             break;
         default:
             goto manual;
         }
     }
+
+    if (connector.radio_type != -1)
+        connector.serial_keying = true;
+    else
+        goto connector_start;
 
     if (connector.radio_type == RADIO_TYPE_SHM)
     {
@@ -341,6 +345,9 @@ int main (int argc, char *argv[])
     }
 #endif
     }
+
+connector_start:
+
     pthread_t tid[3];
 
     pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
