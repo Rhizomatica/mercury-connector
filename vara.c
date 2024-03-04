@@ -45,7 +45,7 @@
 #include "net.h"
 #include "spool.h"
 #include "vara.h"
-#include "serial.h"
+#include "radio_io.h"
 
 void *vara_data_worker_thread_tx(void *conn)
 {
@@ -194,11 +194,11 @@ void *vara_control_worker_thread_rx(void *conn)
                         {
                             if (!memcmp(buffer, "PTT ON", strlen("PTT ON")))
                             {
-                                key_on(connector->serial_fd, connector->radio_type);
+                                key_on();
                             }
                             if (!memcmp(buffer, "PTT OFF", strlen("PTT OFF")))
                             {
-                                key_off(connector->serial_fd, connector->radio_type);
+                                key_off();
                             }
                         }
                         fprintf(stderr, "%s\n", buffer);
@@ -290,25 +290,6 @@ bool initialize_modem_vara(rhizo_conn *connector)
     {
         fprintf(stderr, "Connection to TNC failure.\n");
         return false;
-    }
-
-    if (connector->serial_keying == true)
-    {
-        connector->serial_fd = open_serial_port(connector->serial_path);
-
-        if (connector->serial_fd == -1)
-        {
-            fprintf(stderr, "Could not open serial device.\n");
-            return false;
-        }
-
-        if (connector->radio_type == RADIO_TYPE_ICOM)
-            set_fixed_baudrate("19200", connector->serial_fd);
-
-        if (connector->radio_type == RADIO_TYPE_UBITX){
-            set_fixed_baudrate("38400", connector->serial_fd);
-            sleep(2); // ubitx workaround
-        }
     }
 
     // we start our control thread

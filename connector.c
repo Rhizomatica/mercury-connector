@@ -50,10 +50,13 @@
 #include "spool.h"
 #include "vara.h"
 #include "ardop.h"
-#include "serial.h"
+#include "radio_io.h"
+#include "sbitx_io.h"
+#include "shm_utils.h"
 
-// temporary global variable to enable sockets closure
+// global variables for access from anywhere
 rhizo_conn *tmp_conn = NULL;
+controller_conn *sbitx_connector = NULL;
 RIG *radio;
 
 void finish(int s){
@@ -130,6 +133,7 @@ bool initialize_connector(rhizo_conn *connector){
 int main (int argc, char *argv[])
 {
     rhizo_conn connector;
+
     tmp_conn = &connector;
 
     initialize_connector(&connector);
@@ -168,6 +172,7 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -f features                Enable/Disable features. Supported features: ofdm, noofdm (ARDOP ONLY).\n");
         fprintf(stderr, " -m [radio_model]           Sets HAMLIB radio model\n");
         fprintf(stderr, " -r [radio_address]         Sets HAMLIB radio device file or ip:port address\n");
+        fprintf(stderr, " -s                         Use HERMES's shared memory interface instead of HAMLIB\n");
         fprintf(stderr, " -l                         List HAMLIB supported radio models\n");
 
         fprintf(stderr, " -h                          Prints this help.\n");
@@ -176,7 +181,7 @@ int main (int argc, char *argv[])
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:i:o:c:d:p:a:t:f:s:x:m:l")) != -1)
+    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:l")) != -1)
     {
         switch (opt)
         {
@@ -232,41 +237,57 @@ int main (int argc, char *argv[])
             strcpy(connector.serial_path, optarg);
             break;
         case 'm':
-            connector.radio_type =  atoi(optarg);
+            connector.radio_type = RADIO_TYPE_SHM;
+            break;
+       case 's':
+            connector.radio_type =  0;
             break;
         default:
             goto manual;
         }
     }
 
-    radio = rig_init(connector.radio_type);
-    if (!radio)
+    if (connector.radio_type == RADIO_TYPE_SHM)
     {
-        fprintf(stderr, "Unknown rig num %u, or initialization error.\n", connector.radio_type);
-        fprintf(stderr, "Please check available radios with -l option.\n");
-        exit(2);
+        if (shm_is_created(SYSV_SHM_CONTROLLER_KEY_STR, sizeof(controller_conn)) == false)
+        {
+            fprintf(stderr, "Connector SHM not created. Is sbitx_controller running?\n");
+            return EXIT_FAILURE;
+        }
+
+        sbitx_connector = (controller_conn *) shm_attach(SYSV_SHM_CONTROLLER_KEY_STR, sizeof(controller_conn));
     }
-
-    if (connector.serial_path[0])
-        strncpy(radio->state.rigport.pathname, connector.serial_path, HAMLIB_FILPATHLEN - 1);
-
-    int ret;
-
-    ret = rig_open(radio);
-    if (ret != RIG_OK)
+    else
     {
-        fprintf(stderr, "rig_open: error = %s %s \n", connector.serial_path, rigerror(ret));
-        return EXIT_FAILURE;
-    }
+        radio = rig_init(connector.radio_type);
+        if (!radio)
+        {
+            fprintf(stderr, "Unknown rig num %u, or initialization error.\n", connector.radio_type);
+            fprintf(stderr, "Please check available radios with -l option.\n");
+            exit(2);
+        }
 
-    if (radio->caps->rig_model == RIG_MODEL_NETRIGCTL)
-    {
-        /* We automatically detect if we need to be in vfo mode or not */
-        int rigctld_vfo_opt = netrigctl_get_vfo_mode(radio);
-        int vfo_opt = radio->state.vfo_opt = rigctld_vfo_opt;
-        rig_debug(RIG_DEBUG_TRACE, "%s vfo_opt=%d\n", __func__, vfo_opt);
-    }
+        if (connector.serial_path[0])
+            strncpy(radio->state.rigport.pathname, connector.serial_path, HAMLIB_FILPATHLEN - 1);
 
+        int ret;
+
+        ret = rig_open(radio);
+        if (ret != RIG_OK)
+        {
+            fprintf(stderr, "rig_open: error = %s %s \n", connector.serial_path, rigerror(ret));
+            return EXIT_FAILURE;
+        }
+
+        if (radio->caps->rig_model == RIG_MODEL_NETRIGCTL)
+        {
+            /* We automatically detect if we need to be in vfo mode or not */
+            int rigctld_vfo_opt = netrigctl_get_vfo_mode(radio);
+            radio->state.vfo_opt = rigctld_vfo_opt;
+            // rig_debug(RIG_DEBUG_TRACE, "%s vfo_opt=%d\n", __func__, vfo_opt);
+        }
+
+#if 0
     vfo_t vfo = 0;
     ret = rig_get_vfo(radio, &vfo);
     if (ret == RIG_OK)
@@ -299,7 +320,7 @@ int main (int argc, char *argv[])
         fprintf(stderr, "rig_get_mode: error =  %s \n", rigerror(ret));
     }
 
-#if 0
+
     ret = rig_set_mode(radio, RIG_VFO_CURR, RIG_MODE_LSB, RIG_PASSBAND_NORMAL);
     if (ret != RIG_OK )
     {
@@ -319,7 +340,7 @@ int main (int argc, char *argv[])
         fprintf(stderr, "rig_set_ptt: error = %s \n", rigerror(ret));
     }
 #endif
-
+    }
     pthread_t tid[3];
 
     pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
@@ -335,8 +356,11 @@ int main (int argc, char *argv[])
         // spool needs to re-read the input directory...
     }
 
-    rig_close(radio);
-    rig_cleanup(radio);
+    if (connector.radio_type != RADIO_TYPE_SHM)
+    {
+        rig_close(radio);
+        rig_cleanup(radio);
+    }
 
     return EXIT_SUCCESS;
 }
