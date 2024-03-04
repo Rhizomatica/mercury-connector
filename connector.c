@@ -237,10 +237,10 @@ int main (int argc, char *argv[])
             strcpy(connector.serial_path, optarg);
             break;
         case 'm':
-            connector.radio_type = RADIO_TYPE_SHM;
+            connector.radio_type = atoi(optarg);
             break;
        case 's':
-            connector.radio_type =  0;
+            connector.radio_type = RADIO_TYPE_SHM;
             break;
         default:
             goto manual;
