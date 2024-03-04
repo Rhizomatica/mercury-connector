@@ -1,30 +1,35 @@
-# Rhizo-HF-connector
+# Mercury-connector
 
-  Rhizo-HF-connector is a file exchange solution compatible with different
-  HF modems.
+  Mercury-connector is a file exchange solution compatible with different
+  HF modems. Used especially for testing and comparisson purposes, it supports
+  hamlib and HERMES's shared memory interfaces for radio's keying.
 
-  Rhizo-HF-connector controls a TNC to transmit or receive files,
-  though a inotify-driven interface, in which files written to a specified directory
-  are automatically transmitted by the TNC, and files received from TNC are
-  written to a specified directory.
+  Mercury-connector connects a modem/TNC for transmitting or receiving files,
+  through an inotify-driven interface. Mercury-connector expects a file to be
+  copied to a specified input directory, and automatically transmits it throught the TNC, 
+  while received files are written to a specified output directory.
 
   Support for the following TNCs are implemented: Ardop (works
-  in both normal ardop or experimental ofdm mode) and VARA.
+  in both normal ardop or experimental ofdm mode), VARA and Mercury.
 
 ## Usage
 
-| Option | Description |
-| --- | --- |
-| -r [ardop,vara] | Choose modem/radio type |
-| -i input_spool_directory | Input spool directory (Messages to send) |
-| -o output_spool_directory | Output spool directory (Received messages) |
-| -c callsign | Station Callsign (Eg: PU2HFF) |
-| -d remote_callsign | Remote Station Callsign |
-| -a tnc_ip_address | IP address of the TNC |
-| -p tcp_base_port | TCP base port of the TNC. For VARA and ARDOP ports tcp_base_port and tcp_base_port+1 are used |
-| -t timeout | Time to wait before disconnect when idling |
-| -f features | Enable/Disable features. Supported features: ofdm, noofdm.|
-| -h | Prints this help |
+| Option                    | Description                                                                                  |
+|---------------------------|----------------------------------------------------------------------------------------------|
+| -x [ardop,vara,mercury]   | Choose modem/TNC type                                                                        |
+| -i input_spool_directory  | Input spool directory (Messages to send)                                                     |
+| -o output_spool_directory | Output spool directory (Received messages)                                                   |
+| -c callsign               | Station Callsign (Eg: PU2HFF)                                                                |
+| -d remote_callsign        | Remote Station Callsign                                                                      |
+| -a tnc_ip_address         | IP address of the TNC                                                                        |
+| -p tcp_base_port          | TCP base port of the TNC. Control port is tcp_base_port and tcp_base_port+1 is the data port |
+| -t timeout                | Time to wait before disconnect when idling                                                   |
+| -f features               | Enable/Disable features. Supported features: ofdm, noofdm.                                   |
+| -m radio_model            | Sets HAMLIB radio model                                                                      |
+| -r radio_address          | Sets HAMLIB radio device file or ip:port address                                             |
+| -s                        | Use HERMES's shared memory interface instead of HAMLIB (Do not use -r and -m in this case)   |
+| -l                        | List HAMLIB supported radio models                                                           |
+| -h                        | Prints this help                                                                             |
 
 ### Ardop
 
@@ -38,15 +43,15 @@ With the following ALSA configuration (global-wide ALSA configuration in "/etc/a
 
     pcm.ARDOP {type rate slave {pcm "hw:1,0" rate 48000}}
 
-Associated rz-hf-connector command example (If not specified, Ardop's mode defaults to "ofdm"):
+Associated mercury-connector command example:
 
-    $ rz-hf-connector -r ardop -i /var/spool/outgoing_messages/ -o /var/spool/incoming_messages/ -c BB2UIT -d PP2UIT -a 127.0.0.1 -p 8515 -t 60
+    $ mercury-connector -x ardop -i /var/spool/outgoing_messages/ -o /var/spool/incoming_messages/ -c BB2UIT -d PP2UIT -a 127.0.0.1 -p 8515 -t 60
 
 ### Vara
 
-Example for running rz-hf-connector with VARA modem, on base port 8300:
+Example for running mercury-connector with VARA modem, on base port 8300, and keying an ICOM IC-7100 using hamlib:
 
-    $ rz-hf-connector -r vara -i l1/ -o l2/ -c BB2ITU -d UU2ITU -a 127.0.0.1 -p 8300 -t 60
+    $ mercury-connector -r vara -i l1/ -o l2/ -c BB2ITU -d UU2ITU -a 127.0.0.1 -p 8300 -t 60 -r /dev/ttyUSB0 -m 370
 
 ## Author
 

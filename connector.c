@@ -87,12 +87,11 @@ void *modem_thread(void *conn)
 {
     rhizo_conn *connector = (rhizo_conn *) conn;
 
-#if 0
     if (!strcmp("mercury", connector->modem_type))
     {
-        initialize_modem_mercury(connector);
+        initialize_modem_vara(connector); // using VARA compatibility layer for now
+        // initialize_modem_mercury(connector);
     }
-#endif
 
     if (!strcmp("vara", connector->modem_type))
     {
@@ -158,7 +157,7 @@ int main (int argc, char *argv[])
     if (argc < 2)
     {
     manual:
-        fprintf(stderr, "Usage modes: \n%s -r radio_modem_type -i input_spool_directory -o output_spool_directory -c callsign -d remote_callsign -a tnc_ip_address -p tcp_base_port\n", argv[0]);
+        fprintf(stderr, "Usage modes: \n%s -x modem_type -i input_spool_directory -o output_spool_directory -c callsign -d remote_callsign -a tnc_ip_address -p tcp_base_port -m hamlib_radio_model -r radio_address\n", argv[0]);
         fprintf(stderr, "%s -h\n", argv[0]);
         fprintf(stderr, "\nOptions:\n");
         fprintf(stderr, " -x [mercury,ardop,vara]           Choose modem/radio type.\n");
@@ -172,7 +171,7 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -f features                Enable/Disable features. Supported features: ofdm, noofdm (ARDOP ONLY).\n");
         fprintf(stderr, " -m [radio_model]           Sets HAMLIB radio model\n");
         fprintf(stderr, " -r [radio_address]         Sets HAMLIB radio device file or ip:port address\n");
-        fprintf(stderr, " -s                         Use HERMES's shared memory interface instead of HAMLIB\n");
+        fprintf(stderr, " -s                         Use HERMES's shared memory interface instead of HAMLIB (Do not use -r and -m in this case)\n");
         fprintf(stderr, " -l                         List HAMLIB supported radio models\n");
 
         fprintf(stderr, " -h                          Prints this help.\n");
