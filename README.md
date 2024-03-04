@@ -53,6 +53,12 @@ Example for running mercury-connector with VARA modem, on base port 8300, and ke
 
     $ mercury-connector -r vara -i l1/ -o l2/ -c BB2ITU -d UU2ITU -a 127.0.0.1 -p 8300 -t 60 -r /dev/ttyUSB0 -m 370
 
+### Mercury
+
+Example for running mercury-connector with Mercury modem, on base port 7002, and keying a sBitx through HERMES's shared memory interface:
+
+    $ mercury-connector  -x mercury -i in/ -o out/ -c PY4ZIT -d PY4ABC -a 127.0.0.1 -p 7002 -s
+
 ## Author
 
 Rafael Diniz <rafael (AT) rhizomatica (DOT) org>
