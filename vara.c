@@ -102,8 +102,11 @@ void *vara_data_worker_thread_rx(void *conn)
             sleep(1);
         }
         buf_size = 0;
+        printf("HERE 1\n");
         connector->tcp_ret_ok &= tcp_read(connector->data_socket, (uint8_t *) &buf_size, sizeof(buf_size));
         connector->safe_state--;
+
+        printf("READ MTF! buf_size: %u\n", buf_size);
 
         connector->timeout_counter = 0;
 
