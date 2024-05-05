@@ -236,6 +236,14 @@ void *vara_control_worker_thread_tx(void *conn)
     strcpy(buffer,"BW2300\r");
     connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *) buffer, strlen(buffer));
 
+//    if (vara_p2p_mode)
+//    {
+        memset(buffer,0,sizeof(buffer));
+        strcpy(buffer,"P2P SESSION\r");
+        connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *) buffer, strlen(buffer));
+//    }
+
+
     // 1Hz function
     while(connector->tcp_ret_ok)
     {
