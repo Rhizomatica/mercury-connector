@@ -88,11 +88,13 @@ exit_local:
 void *vara_data_worker_thread_rx(void *conn)
 {
     rhizo_conn *connector = (rhizo_conn *) conn;
-    uint8_t *buffer;
+    int block_size = 64;
+    uint8_t buffer[64];
     uint32_t buf_size;
 
-    while(connector->tcp_ret_ok){
 
+    while(connector->tcp_ret_ok)
+    {
         connector->safe_state++;
         while (connector->connected == false) {
             if (connector->tcp_ret_ok == false){
@@ -102,26 +104,31 @@ void *vara_data_worker_thread_rx(void *conn)
             sleep(1);
         }
         buf_size = 0;
-        printf("HERE 1\n");
+
         connector->tcp_ret_ok &= tcp_read(connector->data_socket, (uint8_t *) &buf_size, sizeof(buf_size));
         connector->safe_state--;
 
-        printf("READ MTF! buf_size: %u\n", buf_size);
+        fprintf(stderr,"Incoming message of size: %u.\n", buf_size);
+		write_buffer(&connector->out_buffer, (uint8_t *) &buf_size, sizeof(buf_size));
 
         connector->timeout_counter = 0;
 
-        buffer = (uint8_t *) malloc (buf_size);
-        memset(buffer, 0, buf_size);
-        connector->tcp_ret_ok &= tcp_read(connector->data_socket, buffer, buf_size);
-
-        fprintf(stderr,"Message of size: %u received.\n", buf_size);
-
-        write_buffer(&connector->out_buffer, (uint8_t *) &buf_size, sizeof(buf_size));
-        write_buffer(&connector->out_buffer, buffer, buf_size);
-
-        connector->timeout_counter = 0;
-
-        free(buffer);
+        while (buf_size != 0)
+        {
+            if (buf_size >= block_size)
+            {
+                connector->tcp_ret_ok &= tcp_read(connector->data_socket, buffer, block_size);
+                write_buffer(&connector->out_buffer, buffer, block_size);
+                buf_size -= block_size;
+            }
+            else
+            {
+                connector->tcp_ret_ok &= tcp_read(connector->data_socket, buffer, buf_size);
+                write_buffer(&connector->out_buffer, buffer, buf_size);
+                buf_size = 0;
+            }
+            connector->timeout_counter = 0;
+        }
     }
 
 exit_local:
