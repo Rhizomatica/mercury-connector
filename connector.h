@@ -44,7 +44,7 @@ extern "C" {
 #endif
 
 // 60s
-#define TIMEOUT_DEFAULT 30
+#define TIMEOUT_DEFAULT 60
 
 typedef struct{
 // public
