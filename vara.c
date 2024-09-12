@@ -108,8 +108,7 @@ void *vara_data_worker_thread_rx(void *conn)
         connector->tcp_ret_ok &= tcp_read(connector->data_socket, (uint8_t *) &buf_size, sizeof(buf_size));
         connector->safe_state--;
 
-        fprintf(stderr,"Incoming message of size: %u.\n", buf_size);
-		write_buffer(&connector->out_buffer, (uint8_t *) &buf_size, sizeof(buf_size));
+        write_buffer(&connector->out_buffer, (uint8_t *) &buf_size, sizeof(buf_size));
 
         connector->timeout_counter = 0;
 
