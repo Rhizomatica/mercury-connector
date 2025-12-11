@@ -1,6 +1,6 @@
 /* sBitx controller shm interface
  *
- * Copyright (C) 2023-2024 Rhizomatica
+ * Copyright (C) 2023-2025 Rhizomatica
  * Author: Rafael Diniz <rafael@rhizomatica.org>
  *
  * This is free software; you can redistribute it and/or modify
@@ -26,21 +26,20 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
-// boilerplate for C/C++ atomic type interoperability
+
 #ifdef __cplusplus
-#include <atomic>
-using namespace std;
 extern "C" {
-#else
-#include <stdatomic.h>
 #endif
 
 #define MAX_MODEM_PATH 4096
 #define MAX_BUF_SIZE 4096
 
 #define SYSV_SHM_CONTROLLER_KEY_STR 66650 // key for the controller_conn struct
+
+#define MAX_MESSAGE_SIZE 128
 
 typedef struct
 {
@@ -56,6 +55,9 @@ typedef struct
 
     int radio_fd;
 
+    // for messaging system
+    char message[MAX_MESSAGE_SIZE];
+    atomic_bool message_available;
 } controller_conn;
 
 
