@@ -46,6 +46,9 @@ extern "C" {
 // 90s
 #define TIMEOUT_DEFAULT 90
 
+// longest filename written to the output spool
+#define MAX_RX_NAME_LEN 100
+
 typedef struct{
 // public
     char call_sign[32];

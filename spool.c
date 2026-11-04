@@ -43,6 +43,8 @@
 #include <dirent.h>
 #include <sys/inotify.h>
 #include <libgen.h>
+#include <errno.h>
+#include <time.h>
 
 #include "spool.h"
 
@@ -137,66 +139,161 @@ bool write_message_to_buffer(char *msg_path, rhizo_conn *connector){
     return true;
 }
 
+/* Make a received filename safe to use in the output spool: keep only the
+ * last path component, allow [A-Za-z0-9._-], no leading dots (hidden files
+ * are reserved for our own temp files), bounded length. Falls back to a
+ * generated name if nothing usable is left. */
+static void sanitize_rx_name(const char *in, size_t in_len, char *out, size_t out_size)
+{
+    static unsigned long counter = 0;
+    size_t start = 0, n = 0;
+
+    for (size_t i = 0; i < in_len; i++)
+        if (in[i] == '/' || in[i] == '\\')
+            start = i + 1;
+
+    for (size_t i = start; i < in_len && n < MAX_RX_NAME_LEN && n + 1 < out_size; i++)
+    {
+        char c = in[i];
+        if (n == 0 && (c == '.' || c == '-'))
+            continue;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '.' || c == '_' || c == '-')
+            out[n++] = c;
+        else
+            out[n++] = '_';
+    }
+    out[n] = 0;
+
+    if (n == 0)
+        snprintf(out, out_size, "rx_%ld_%lu.msg", (long) time(NULL), counter++);
+}
+
+/* true if the file at path holds exactly data[0..len) */
+static bool file_has_content(const char *path, const uint8_t *data, size_t len)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || (size_t) st.st_size != len)
+        return false;
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return false;
+
+    uint8_t buf[4096];
+    size_t off = 0, r;
+    bool same = true;
+    while (same && (r = fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+        if (off + r > len || memcmp(buf, data + off, r) != 0)
+            same = false;
+        off += r;
+    }
+    fclose(f);
+    return same && off == len;
+}
+
+/* Read one COMPLETE frame (4-byte length, "filename\n", payload) from the
+ * out buffer and store it in the output spool. The file is written under a
+ * hidden temp directory first and then hard-linked into place, so readers
+ * of the spool never see a partially written file, and an existing file is
+ * never overwritten: an identical copy (a resend after a lost ack) is
+ * dropped, a different one gets a ".N" suffix. */
 bool read_message_from_buffer(rhizo_conn *connector){
-    char msg_path[1024];
-    int index = 0;
-    char ch;
-    uint32_t msg_size = 0;
-    uint8_t buffer[64];
-    int block_size = 64;
+    uint32_t frame_size = 0;
+    char name[MAX_RX_NAME_LEN + 1];
+    char tmp_path[1400], final_path[1400];
+    static unsigned long tmp_counter = 0;
 
-    read_buffer(&connector->out_buffer, (uint8_t *) &msg_size, sizeof(msg_size));
+    read_buffer(&connector->out_buffer, (uint8_t *) &frame_size, sizeof(frame_size));
+    if (frame_size == 0)
+        return false;
 
-    strcpy(msg_path, connector->output_directory);
-    do {
-        read_buffer(&connector->out_buffer, (uint8_t *) &ch, 1);
-        msg_path[strlen(connector->output_directory)+index] = ch;
-        index++;
-    } while(ch != '\n'); // TODO read from buffer the filename....
+    uint8_t *frame = (uint8_t *) malloc(frame_size);
+    if (frame == NULL){
+        // can't hold it, but must still consume it to keep the buffer framed
+        uint8_t sink[4096];
+        uint32_t left = frame_size;
+        while (left){
+            uint32_t chunk = left > sizeof(sink) ? sizeof(sink) : left;
+            read_buffer(&connector->out_buffer, sink, chunk);
+            left -= chunk;
+        }
+        fprintf(stderr, "Out of memory: dropped a received message of %u bytes.\n", frame_size);
+        return false;
+    }
+    read_buffer(&connector->out_buffer, frame, frame_size);
 
-    msg_path[strlen(connector->output_directory)+index-1] = 0;
+    // filename is everything up to the first '\n' (searched within a bounded prefix)
+    size_t scan = frame_size < 512 ? frame_size : 512;
+    uint8_t *nl = memchr(frame, '\n', scan);
+    const uint8_t *payload;
+    size_t payload_len;
 
-    msg_size -= index;
+    if (nl != NULL){
+        sanitize_rx_name((const char *) frame, (size_t) (nl - frame), name, sizeof(name));
+        payload = nl + 1;
+        payload_len = frame_size - (size_t) (nl - frame) - 1;
+    }
+    else{
+        fprintf(stderr, "Received message has no filename line, saving it under a generated name.\n");
+        sanitize_rx_name("", 0, name, sizeof(name));
+        payload = frame;
+        payload_len = frame_size;
+    }
 
-    fprintf(stderr, "Incoming message %s with payload size %u.\n", basename(msg_path), msg_size);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.rx-tmp/%s.%ld.%lu", connector->output_directory, name,
+             (long) getpid(), tmp_counter++);
 
-    FILE *fp = fopen (msg_path, "w");
+    FILE *fp = fopen(tmp_path, "w");
     if (fp == NULL){
-        fprintf(stderr, "read_message_from_buffer: Message %s could not be opened.\n", msg_path);
+        fprintf(stderr, "read_message_from_buffer: %s could not be opened (%s).\n", tmp_path, strerror(errno));
+        free(frame);
+        return false;
+    }
+    bool ok = fwrite(payload, 1, payload_len, fp) == payload_len;
+    ok &= fflush(fp) == 0;
+    ok &= fsync(fileno(fp)) == 0;
+    ok &= fclose(fp) == 0;
+    if (!ok){
+        fprintf(stderr, "read_message_from_buffer: error writing %s (%s).\n", tmp_path, strerror(errno));
+        unlink(tmp_path);
+        free(frame);
         return false;
     }
 
-    uint32_t counter = msg_size;
-    while (counter != 0){
-#if 0
-        read_buffer(&connector->out_buffer, buffer, 1);
-        fwrite(buffer, 1, 1, fp);
-        counter--;
-//        fprintf(stderr, "%c", buffer[0]);
-#else
-        if (counter >= block_size){
-            read_buffer(&connector->out_buffer, buffer, block_size);
-            fwrite(buffer, 1, block_size, fp);
-			fflush(fp);
-            counter -= block_size;
+    // publish without ever overwriting: link() fails if the name exists
+    bool stored = false;
+    for (int suffix = 0; suffix < 1000 && !stored; suffix++){
+        if (suffix == 0)
+            snprintf(final_path, sizeof(final_path), "%s%s", connector->output_directory, name);
+        else
+            snprintf(final_path, sizeof(final_path), "%s%s.%d", connector->output_directory, name, suffix);
+
+        if (link(tmp_path, final_path) == 0){
+            stored = true;
+            fprintf(stderr, "Incoming message %s with payload size %zu.\n", basename(final_path), payload_len);
+        }
+        else if (errno == EEXIST){
+            if (file_has_content(final_path, payload, payload_len)){
+                fprintf(stderr, "Incoming message %s is a duplicate of one already received, dropped.\n", name);
+                break;
+            }
         }
         else{
-            read_buffer(&connector->out_buffer, buffer, counter);
-            fwrite(buffer, 1, counter, fp);
-            counter = 0;
+            fprintf(stderr, "read_message_from_buffer: could not store %s (%s).\n", final_path, strerror(errno));
+            break;
         }
-#endif
-//        fprintf(stderr, "rx counter: %u\n", counter);
     }
-
-    fclose(fp);
-
-    return true;
+    unlink(tmp_path);
+    free(frame);
+    return stored;
 }
 
 void *spool_output_directory_thread(void *conn)
 {
     rhizo_conn *connector = (rhizo_conn *) conn;
+    char tmp_dir[1100];
 
     DIR *dirp = opendir(connector->output_directory);
     if (dirp == NULL){
@@ -204,6 +301,14 @@ void *spool_output_directory_thread(void *conn)
         return NULL;
     }
     closedir(dirp);
+
+    // temp area for received files; hidden, and a directory, so spool
+    // consumers that only look at regular files never pick it up
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s.rx-tmp", connector->output_directory);
+    if (mkdir(tmp_dir, 0775) != 0 && errno != EEXIST){
+        fprintf(stderr, "Could not create %s (%s).\n", tmp_dir, strerror(errno));
+        return NULL;
+    }
 
     while (true){
         read_message_from_buffer(connector);
