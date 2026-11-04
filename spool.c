@@ -209,9 +209,11 @@ bool read_message_from_buffer(rhizo_conn *connector){
     if (frame_size == 0)
         return false;
 
-    uint8_t *frame = (uint8_t *) malloc(frame_size);
+    // the length comes from the remote station: never allocate what it asks
+    // for beyond MAX_RX_MSG_SIZE
+    uint8_t *frame = frame_size <= MAX_RX_MSG_SIZE ? (uint8_t *) malloc(frame_size) : NULL;
     if (frame == NULL){
-        // can't hold it, but must still consume it to keep the buffer framed
+        // too big, or can't hold it, but must still consume it to keep the buffer framed
         uint8_t sink[4096];
         uint32_t left = frame_size;
         while (left){
@@ -219,7 +221,8 @@ bool read_message_from_buffer(rhizo_conn *connector){
             read_buffer(&connector->out_buffer, sink, chunk);
             left -= chunk;
         }
-        fprintf(stderr, "Out of memory: dropped a received message of %u bytes.\n", frame_size);
+        fprintf(stderr, "Dropped a received message of %u bytes (%s).\n", frame_size,
+                frame_size > MAX_RX_MSG_SIZE ? "too big" : "out of memory");
         return false;
     }
     read_buffer(&connector->out_buffer, frame, frame_size);
