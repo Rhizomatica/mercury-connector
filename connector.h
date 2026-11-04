@@ -46,6 +46,11 @@ extern "C" {
 // 90s
 #define TIMEOUT_DEFAULT 90
 
+// largest frame (filename + payload) accepted from the air
+#define MAX_RX_MSG_SIZE (16u * 1024u * 1024u)
+// longest filename written to the output spool
+#define MAX_RX_NAME_LEN 100
+
 typedef struct{
 // public
     char call_sign[32];
