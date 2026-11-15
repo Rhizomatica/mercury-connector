@@ -12,6 +12,26 @@
   Support for the following TNCs are implemented: Ardop (works
   in both normal ardop or experimental ofdm mode), VARA and Mercury.
 
+## Compilation and Installation
+
+On a Debian based system (e.g., Debian, Ubuntu), the dependencies can be installed with:
+
+```
+apt-get install uthash-dev libhamlib-dev
+```
+
+To compile, use:
+
+```
+make
+```
+
+To install:
+
+```
+sudo make install
+```
+
 ## Usage
 
 | Option                    | Description                                                                                  |
