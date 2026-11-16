@@ -94,12 +94,21 @@ bool remove_all_msg_path_queue(rhizo_conn *connector){
 
 }
 
+/* Load one file into the transmit buffer as a single frame.
+ *
+ * The whole file is read into memory first, so the frame header always
+ * matches what follows it even if the file changes underneath us, and the
+ * frame goes into the ring in one piece or not at all:
+ *  - a file whose frame would be over MAX_RX_MSG_SIZE is never sent (the
+ *    other side would reject it anyway);
+ *  - if the ring has no room for the whole frame right now, nothing is
+ *    written and the file is picked up again later in the session, once the
+ *    modem has taken some of the backlog. Session setup loads with tx parked,
+ *    so a blocking write here would wait forever for space that only the
+ *    parked tx thread can free. */
 bool write_message_to_buffer(char *msg_path, rhizo_conn *connector){
-    uint8_t buffer[BUFFER_SIZE];
-    char *base_path;
-    FILE *f_in;
-    uint32_t msg_size;
-    uint32_t msg_path_size = 0;
+    char name[256];
+    struct stat st;
 
     // every frame we send must be tracked, or it can't be deleted on BUFFER 0
     if (connector->msg_path_queue_size >= MSG_PATH_QUEUE_MAX){
@@ -107,48 +116,63 @@ bool write_message_to_buffer(char *msg_path, rhizo_conn *connector){
         return false;
     }
 
-    f_in = fopen(msg_path,"r");
-    if (f_in == NULL){
-        fprintf(stderr, "write_message_to_buffer: Message %s could not be opened.\n", msg_path);
+    if (stat(msg_path, &st) != 0 || !S_ISREG(st.st_mode)){
+        fprintf(stderr, "write_message_to_buffer: %s is not a readable file, skipped.\n", msg_path);
         return false;
     }
 
-    struct stat st;
-    stat(msg_path, &st);
-    msg_size = (uint32_t) st.st_size;
+    const char *slash = strrchr(msg_path, '/');
+    snprintf(name, sizeof(name), "%s", slash ? slash + 1 : msg_path);
+    size_t name_len = strlen(name) + 1;                 // name + '\n'
+    uint64_t frame_len = (uint64_t) name_len + (uint64_t) st.st_size;
 
-    base_path = basename(msg_path);
-
-    fprintf(stderr, "Loaded message %s with payload size %u.\n", base_path, msg_size);
-
-    msg_path_size = strlen(base_path)+1;
-    msg_size += msg_path_size;
-    base_path[msg_path_size-1] = '\n'; // adding a \n to the 0 in the string (just to make the message clear over the air)
-
-    // our 4 byte header which contains the size of the message
-    write_buffer(&connector->in_buffer, (uint8_t *) &msg_size, sizeof(msg_size));
-
-    // the file path basename
-    write_buffer(&connector->in_buffer, (uint8_t *) base_path, msg_path_size);
-
-    size_t read_count = 0;
-    uint32_t total_read = 0;
-    while ((read_count = fread(buffer, 1, sizeof(buffer), f_in)) > 0){
-        total_read += read_count;
-
-        // fprintf(stderr, "writing to buffer msg of size %u tx now: %lu\n", msg_size, read_count);
-        write_buffer(&connector->in_buffer, buffer, read_count);
+    if (frame_len > MAX_RX_MSG_SIZE){
+        fprintf(stderr, "%s is too big to send (%lld bytes, limit %u): skipped.\n",
+                msg_path, (long long) st.st_size, MAX_RX_MSG_SIZE - (unsigned) name_len);
+        return false;
     }
 
-    if (total_read + msg_path_size != msg_size){
-        fprintf(stderr, "Warning: possible truncated message. FIXME! total_read = %u msg_size = %u\n", total_read + msg_path_size, msg_size);
+    if (ring_buffer_count_free_bytes(&connector->in_buffer.buf) < sizeof(uint32_t) + frame_len){
+        // not an error: retried on the next scan, after the modem drains some
+        return false;
     }
 
+    uint8_t *frame = (uint8_t *) malloc(sizeof(uint32_t) + frame_len);
+    if (frame == NULL){
+        fprintf(stderr, "Out of memory loading %s, will retry.\n", msg_path);
+        return false;
+    }
+
+    FILE *f_in = fopen(msg_path, "r");
+    if (f_in == NULL){
+        fprintf(stderr, "write_message_to_buffer: Message %s could not be opened (%s).\n",
+                msg_path, strerror(errno));
+        free(frame);
+        return false;
+    }
+
+    uint8_t *payload = frame + sizeof(uint32_t) + name_len;
+    size_t got = fread(payload, 1, (size_t) st.st_size, f_in);
+    bool more = (fgetc(f_in) != EOF);
     fclose(f_in);
+    if (got != (size_t) st.st_size || more){
+        // changed while we read it: try again next scan
+        fprintf(stderr, "%s changed while loading, will retry.\n", msg_path);
+        free(frame);
+        return false;
+    }
 
-    base_path[msg_path_size-1] = 0; // reverting to a null terminated string
+    uint32_t msg_size = (uint32_t) frame_len;
+    memcpy(frame, &msg_size, sizeof(msg_size));
+    memcpy(frame + sizeof(uint32_t), name, name_len - 1);
+    frame[sizeof(uint32_t) + name_len - 1] = '\n';   // name ends with \n, readable over the air
+
+    fprintf(stderr, "Loaded message %s with payload size %lld.\n", name, (long long) st.st_size);
+
+    write_buffer(&connector->in_buffer, frame, (int) (sizeof(uint32_t) + frame_len));
+    free(frame);
+
     queue_msg_path(msg_path, connector);
-
     return true;
 }
 
