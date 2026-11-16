@@ -114,16 +114,61 @@ void *vara_data_worker_thread_tx(void *conn)
         connector->safe_state--;
 
         connector->timeout_counter = 0;
+        unsigned gen = connector->rx_session_gen;
 
-        // read header
+        // take one whole frame off the ring (it was written in one piece)
         read_buffer(&connector->in_buffer, (uint8_t *) &buf_size, sizeof(buf_size)); // \todo if the two parties in a connection have different endianess, we are in trouble
 
-        buffer = (uint8_t *) malloc (buf_size);
-        memset(buffer, 0, buf_size);
-        read_buffer(&connector->in_buffer, buffer, buf_size);
+        size_t total = sizeof(buf_size) + (size_t) buf_size;
+        buffer = (uint8_t *) malloc(total);
+        if (buffer == NULL){
+            // can't happen for frames we built (<= MAX_RX_MSG_SIZE); stay in step anyway
+            fprintf(stderr, "Out of memory for a %u byte frame, dropping it (it will be resent).\n", buf_size);
+            uint8_t scratch[4096];
+            for (uint32_t left = buf_size; left > 0; ){
+                uint32_t c = left < sizeof(scratch) ? left : (uint32_t) sizeof(scratch);
+                read_buffer(&connector->in_buffer, scratch, c);
+                left -= c;
+            }
+            continue;
+        }
+        memcpy(buffer, &buf_size, sizeof(buf_size));
+        read_buffer(&connector->in_buffer, buffer + sizeof(buf_size), buf_size);
 
-        connector->tcp_ret_ok &= tcp_write(connector->data_socket, (uint8_t *) &buf_size, sizeof(buf_size) );
-        connector->tcp_ret_ok &= tcp_write(connector->data_socket, buffer, buf_size);
+        // Hand it to the modem, but never a byte after the session is over:
+        // the check and each (non-blocking) write happen under session_lock,
+        // so once DISCONNECTED/CONNECTED is processed nothing more of this
+        // frame goes out. A frame cut short this way was not acknowledged;
+        // its file is kept and sent again next session.
+        size_t off = 0;
+        bool cut = false;
+        while (off < total && connector->tcp_ret_ok){
+            struct pollfd pfd = { .fd = connector->data_socket, .events = POLLOUT };
+            if (poll(&pfd, 1, 500) < 0 && errno != EINTR){
+                connector->tcp_ret_ok = false;
+                break;
+            }
+            pthread_mutex_lock(&session_lock);
+            if (!connector->connected || connector->tx_hold || connector->rx_session_gen != gen){
+                pthread_mutex_unlock(&session_lock);
+                cut = true;
+                break;
+            }
+            size_t chunk = total - off < 65536 ? total - off : 65536;
+            ssize_t w = send(connector->data_socket, buffer + off, chunk, MSG_DONTWAIT | MSG_NOSIGNAL);
+            pthread_mutex_unlock(&session_lock);
+            if (w < 0){
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                    continue;
+                fprintf(stderr, "Data socket write error (%s).\n", strerror(errno));
+                connector->tcp_ret_ok = false;
+                break;
+            }
+            off += (size_t) w;
+        }
+        if (cut && off > 0)
+            fprintf(stderr, "Session ended while sending a frame: stopped after %zu of %zu bytes "
+                    "(the rest is not sent after DISCONNECTED; the file will be resent).\n", off, total);
 
         free(buffer);
     }
@@ -135,19 +180,35 @@ exit_local:
 /* ---------------------------------------------------------------------
  * Receive side.
  *
- * The data socket to the TNC stays open across ARQ sessions, so a plain
- * blocking read that is halfway through a frame when a link drops would
- * keep going with the NEXT session's bytes, merging two messages and
- * misframing everything after them. Instead, every read is bounded by
- * the session it started in (rx_session_gen): a frame is only accepted
- * if all of it arrives within one session; a partial one is discarded
- * (the sender never got BUFFER 0 for it, so it keeps the file and
- * resends it). Bytes arriving while no session is up belong to one that
- * already ended and are dropped. Only complete frames are handed to the
- * output spool thread.
+ * The data socket to the TNC stays open across ARQ sessions, and the modem
+ * reports CONNECTED/DISCONNECTED on the control port while the session's
+ * bytes come in on the data port. Nothing orders the two for us, so:
+ *
+ *  - A frame belongs to the session it started in, and is read to its end
+ *    even if DISCONNECTED is seen first: the modem may already have
+ *    acknowledged bytes we haven't read yet (the sender then gets BUFFER 0
+ *    and deletes the file, so dropping them would lose the message). The
+ *    frame is only given up if a NEW session starts, or no more bytes come
+ *    for RX_TAIL_QUIET_MS after the link went down.
+ *  - Bytes that arrive with no session up are never thrown away on a
+ *    timer. We give a CONNECTED that may be in flight RX_ORPHAN_WAIT_MS to
+ *    show up (then they are that session's first frame); otherwise they are
+ *    a late frame of the session that just ended, and are read as such.
+ *  - A frame that is too big for its session (a guest message over
+ *    GUEST_MAX_MSG) is skipped by its length; the frames after it are read
+ *    normally. Only a header that can't be a real frame (0, or over
+ *    MAX_RX_MSG_SIZE) means the stream is out of step, and then the rest of
+ *    that session's data is discarded.
+ *
+ * Only complete frames are handed to the output spool thread.
  * --------------------------------------------------------------------- */
 
 #define RX_POLL_MS 500
+#define RX_TAIL_QUIET_MS 2000     // link down: wait this long for the rest of a frame
+#define RX_TAIL_SETTLE_MS 100     // link down: let a CONNECTED in flight be parsed before taking bytes
+#define RX_ORPHAN_WAIT_MS 3000    // bytes with no session: wait this long for its CONNECTED
+#define RX_GRACE_STEP_MS 50
+#define RX_SKIP_CHUNK 4096
 
 static void rx_set_safe(rhizo_conn *connector, bool *safe, bool want)
 {
@@ -163,58 +224,18 @@ static void rx_set_safe(rhizo_conn *connector, bool *safe, bool want)
     }
 }
 
-/* Wait up to RX_POLL_MS and throw away whatever is readable.
- *
- * idle: we're between sessions. The modem reports CONNECTED on the control
- * port and the first data on the data port, and nothing orders the two for
- * us: the first frame of a new session can be readable here a moment before
- * the control thread has marked the session up. So before calling bytes
- * stale, give a just-starting session a short grace period, and leave the
- * bytes alone if one shows up. */
-#define RX_NEW_SESSION_GRACE_MS 1000
-#define RX_GRACE_STEP_MS 50
-
-static void rx_discard_pending(rhizo_conn *connector, bool idle)
-{
-    uint8_t scratch[1024];
-    struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
-    unsigned gen0 = connector->rx_session_gen;
-
-    int r = poll(&pfd, 1, RX_POLL_MS);
-    if (r <= 0)
-        return;
-
-    if (idle)
-    {
-        for (int waited = 0; waited < RX_NEW_SESSION_GRACE_MS; waited += RX_GRACE_STEP_MS)
-        {
-            if (connector->connected || connector->rx_session_gen != gen0)
-                return;                 // a session just started: these bytes are its
-            usleep(RX_GRACE_STEP_MS * 1000);
-        }
-    }
-
-    ssize_t len = recv(connector->data_socket, scratch, sizeof(scratch), 0);
-    if (len == 0 || (len < 0 && errno != EINTR))
-    {
-        fprintf(stderr, "Data socket closed by TNC.\n");
-        connector->tcp_ret_ok = false;
-    }
-    else if (len > 0)
-    {
-        fprintf(stderr, "Discarded %zd byte(s) not belonging to a live session.\n", len);
-    }
-}
-
-/* Read exactly n bytes of the session identified by gen. Returns false if
- * that session ends (or a new one starts) first, or the socket fails. */
-static bool rx_read_session(rhizo_conn *connector, uint8_t *buf, size_t n, unsigned gen)
+/* Read exactly n bytes belonging to session gen. While the link is up this
+ * waits as long as it takes (the idle timeout ends a stalled link). Once it
+ * is down, it keeps reading the tail as long as bytes keep coming. Returns
+ * false if a new session starts first, the tail stops, or the socket fails. */
+static bool rx_read_frame_bytes(rhizo_conn *connector, uint8_t *buf, size_t n, unsigned gen)
 {
     size_t got = 0;
+    int quiet_ms = 0;
 
     while (got < n)
     {
-        if (!connector->tcp_ret_ok || !connector->connected || connector->rx_session_gen != gen)
+        if (!connector->tcp_ret_ok || connector->rx_session_gen != gen)
             return false;
 
         struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
@@ -228,11 +249,24 @@ static bool rx_read_session(rhizo_conn *connector, uint8_t *buf, size_t n, unsig
             return false;
         }
         if (r == 0)
+        {
+            if (!connector->connected)
+            {
+                quiet_ms += RX_POLL_MS;
+                if (quiet_ms >= RX_TAIL_QUIET_MS)
+                    return false;
+            }
             continue;
+        }
 
-        // re-check: bytes must not be taken for a session that just ended
-        if (!connector->connected || connector->rx_session_gen != gen)
-            return false;
+        if (!connector->connected)
+        {
+            // these may be the next session's first bytes, with its
+            // CONNECTED not parsed yet: give the control thread a moment
+            usleep(RX_TAIL_SETTLE_MS * 1000);
+            if (connector->rx_session_gen != gen)
+                return false;
+        }
 
         ssize_t len = recv(connector->data_socket, buf + got, n - got, 0);
         if (len < 0)
@@ -250,9 +284,78 @@ static bool rx_read_session(rhizo_conn *connector, uint8_t *buf, size_t n, unsig
             return false;
         }
         got += (size_t) len;
+        quiet_ms = 0;
         connector->timeout_counter = 0;
     }
     return true;
+}
+
+/* Skip n bytes of session gen (a frame we won't keep). */
+static bool rx_skip_bytes(rhizo_conn *connector, uint32_t n, unsigned gen)
+{
+    uint8_t scratch[RX_SKIP_CHUNK];
+    while (n > 0)
+    {
+        uint32_t chunk = n < sizeof(scratch) ? n : (uint32_t) sizeof(scratch);
+        if (!rx_read_frame_bytes(connector, scratch, chunk, gen))
+            return false;
+        n -= chunk;
+    }
+    return true;
+}
+
+/* Throw away everything left of session gen: until a new session starts,
+ * or the link is down and the data has stopped. */
+static void rx_discard_session(rhizo_conn *connector, unsigned gen)
+{
+    uint8_t scratch[RX_SKIP_CHUNK];
+    size_t total = 0;
+    int quiet_ms = 0;
+
+    while (connector->tcp_ret_ok && connector->rx_session_gen == gen)
+    {
+        struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
+        int r = poll(&pfd, 1, RX_POLL_MS);
+        if (r <= 0)
+        {
+            if (!connector->connected && (quiet_ms += RX_POLL_MS) >= RX_TAIL_QUIET_MS)
+                break;
+            continue;
+        }
+        if (!connector->connected)
+        {
+            usleep(RX_TAIL_SETTLE_MS * 1000);
+            if (connector->rx_session_gen != gen)
+                break;
+        }
+        ssize_t len = recv(connector->data_socket, scratch, sizeof(scratch), 0);
+        if (len <= 0)
+        {
+            if (len < 0 && errno == EINTR)
+                continue;
+            fprintf(stderr, "Data socket closed by TNC.\n");
+            connector->tcp_ret_ok = false;
+            break;
+        }
+        total += (size_t) len;
+        quiet_ms = 0;
+    }
+    if (total)
+        fprintf(stderr, "Discarded %zu byte(s) of that session's data.\n", total);
+}
+
+/* Bytes are readable but no session is up. Wait for a CONNECTED that may be
+ * in flight; returns true if one came (the bytes are its), false if not (the
+ * bytes are a late part of the session that just ended). */
+static bool rx_wait_for_session(rhizo_conn *connector, unsigned gen0)
+{
+    for (int waited = 0; waited < RX_ORPHAN_WAIT_MS; waited += RX_GRACE_STEP_MS)
+    {
+        if (connector->connected || connector->rx_session_gen != gen0 || !connector->tcp_ret_ok)
+            return true;
+        usleep(RX_GRACE_STEP_MS * 1000);
+    }
+    return false;
 }
 
 void *vara_data_worker_thread_rx(void *conn)
@@ -266,52 +369,68 @@ void *vara_data_worker_thread_rx(void *conn)
         // idle-timeout logic, exactly like the original header wait
         rx_set_safe(connector, &safe, true);
 
-        if (!connector->connected)
+        struct pollfd pfd = { .fd = connector->data_socket, .events = POLLIN };
+        int r = poll(&pfd, 1, RX_POLL_MS);
+        if (r < 0 && errno != EINTR)
         {
-            rx_discard_pending(connector, true);
-            continue;
+            fprintf(stderr, "Data socket poll error (%s).\n", strerror(errno));
+            connector->tcp_ret_ok = false;
+            break;
         }
+        if (r <= 0)
+            continue;
 
         unsigned gen = connector->rx_session_gen;
-        uint32_t frame_size = 0;
+        if (!connector->connected && !rx_wait_for_session(connector, gen))
+        {
+            fprintf(stderr, "Data with no session up: reading it as a late part of the last session.\n");
+        }
+        gen = connector->rx_session_gen;
 
-        if (!rx_read_session(connector, (uint8_t *) &frame_size, sizeof(frame_size), gen))
+        // who sent this frame: fixed when it starts
+        int kind = connector->session_kind;
+        if (gen == 0 && !connector->connected)
+            // before any session at all: nobody to attribute it to
+            kind = connector->guests_enabled ? SESSION_REJECTED : SESSION_PEER;
+
+        uint32_t frame_size = 0;
+        if (!rx_read_frame_bytes(connector, (uint8_t *) &frame_size, sizeof(frame_size), gen))
             continue;
 
         if (frame_size == 0 || frame_size > MAX_RX_MSG_SIZE)
         {
             fprintf(stderr, "Corrupt frame header (length %u): discarding the rest of this session's data.\n",
                     frame_size);
-            while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
-                rx_discard_pending(connector, false);
-            continue;
-        }
-
-        int kind = connector->session_kind;
-        if (kind == SESSION_REJECTED || (kind == SESSION_GUEST && frame_size > GUEST_MAX_MSG))
-        {
-            fprintf(stderr, kind == SESSION_REJECTED
-                    ? "Data from a station that is neither a peer nor a valid callsign: discarded.\n"
-                    : "Guest message too long (%u bytes, max %d): discarding the rest of this session's data.\n",
-                    frame_size, GUEST_MAX_MSG);
-            while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
-                rx_discard_pending(connector, false);
+            rx_discard_session(connector, gen);
             continue;
         }
 
         rx_set_safe(connector, &safe, false);   // mid-frame: not idle
 
-        uint8_t *frame = (uint8_t *) malloc(frame_size);
-        if (frame == NULL)
+        if (kind == SESSION_REJECTED)
         {
-            fprintf(stderr, "Out of memory for a %u byte frame, discarding the rest of this session.\n", frame_size);
-            rx_set_safe(connector, &safe, true);
-            while (connector->tcp_ret_ok && connector->connected && connector->rx_session_gen == gen)
-                rx_discard_pending(connector, false);
+            fprintf(stderr, "Data from a station that is neither a peer nor a valid callsign: discarded.\n");
+            rx_discard_session(connector, gen);
             continue;
         }
 
-        if (!rx_read_session(connector, frame, frame_size, gen))
+        if (kind == SESSION_GUEST && frame_size > GUEST_MAX_MSG)
+        {
+            fprintf(stderr, "Guest message too long (%u bytes, max %d): skipped.\n", frame_size, GUEST_MAX_MSG);
+            if (!rx_skip_bytes(connector, frame_size, gen))
+                fprintf(stderr, "Link lost inside the skipped message.\n");
+            continue;
+        }
+
+        uint8_t *frame = (uint8_t *) malloc(frame_size);
+        if (frame == NULL)
+        {
+            fprintf(stderr, "Out of memory for a %u byte frame: skipped, sender will retry.\n", frame_size);
+            rx_skip_bytes(connector, frame_size, gen);
+            continue;
+        }
+
+        if (!rx_read_frame_bytes(connector, frame, frame_size, gen))
         {
             fprintf(stderr, "Link lost mid-message: partial message (%u bytes expected) discarded, "
                     "sender will retry.\n", frame_size);
@@ -370,7 +489,9 @@ void *vara_control_worker_thread_rx(void *conn)
                 pthread_mutex_lock(&session_lock);
                 connector->incoming_pending = false;
                 connector->tx_hold = true;        // park tx before anything else
-                connector->rx_session_gen++;      // abandon any partial rx frame
+                // rx_session_gen is NOT bumped here: a frame in progress may
+                // still finish (its tail can be read after this line); only
+                // the next CONNECTED ends it for good
                 connector->connected = false;
                 connector->waiting_for_connection = false;
                 pthread_mutex_unlock(&session_lock);
