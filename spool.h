@@ -64,5 +64,7 @@ bool spool_peer_has_mail(rhizo_conn *connector, int peer_idx);
 int spool_load_peer(rhizo_conn *connector, int peer_idx);
 void spool_reset_tx(rhizo_conn *connector);
 int spool_load_call(rhizo_conn *connector, const char *call_sign);
+bool spool_any_has_mail(rhizo_conn *connector);
+int spool_load_any(rhizo_conn *connector);
 
 #endif /* HAVE_SPOOL__ */

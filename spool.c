@@ -570,6 +570,18 @@ int spool_load_peer(rhizo_conn *connector, int peer_idx)
     return count;
 }
 
+/* No -d at all (num_peers == 0): like master, the input spool itself goes
+ * to whichever station connects. */
+bool spool_any_has_mail(rhizo_conn *connector)
+{
+    return scan_dir(connector, connector->input_directory, false) > 0;
+}
+
+int spool_load_any(rhizo_conn *connector)
+{
+    return scan_dir(connector, connector->input_directory, true);
+}
+
 /* Guests: load <input_directory>/<CALL>/ (call already validated). */
 int spool_load_call(rhizo_conn *connector, const char *call_sign)
 {

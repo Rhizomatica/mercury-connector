@@ -231,7 +231,8 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -c callsign                        Station Callsign (Eg: PU2HFF).\n");
         fprintf(stderr, " -d remote_callsign[,call2,...] Remote Station Callsign(s). With several, outgoing mail goes in\n");
         fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/; files in input_spool_directory\n");
-        fprintf(stderr, "                               itself go to the first one (VARA/Mercury only).\n");
+        fprintf(stderr, "                               itself go to the first one (VARA/Mercury only). Optional: without\n");
+        fprintf(stderr, "                               it nothing is called and the spool goes to whoever connects.\n");
         fprintf(stderr, " -w retry_wait                Seconds before calling a station again after a failed call or\n");
         fprintf(stderr, "                               finished session (default %d).\n", RETRY_BACKOFF_DEFAULT);
         fprintf(stderr, " -g                           Guest mode (VARA/Mercury): any station may connect for an echo\n");
@@ -333,11 +334,11 @@ int main (int argc, char *argv[])
         }
     }
 
+    // -d is optional, as on master: without it the connector never calls
+    // out, and (VARA/Mercury) anything in the input spool goes to whichever
+    // station connects
     if (connector.num_peers == 0)
-    {
-        fprintf(stderr, "A remote callsign (-d) is required.\n");
-        goto manual;
-    }
+        fprintf(stderr, "No remote callsign (-d): not calling out; the input spool goes to any station that connects.\n");
 
     if (connector.radio_type != -1)
         connector.serial_keying = true;

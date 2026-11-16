@@ -532,6 +532,13 @@ void *vara_control_worker_thread_tx(void *conn)
                 fprintf(stderr, "Session with \"%s\": not a peer and not a valid callsign, nothing will be kept.\n",
                         connector->session_peer);
             }
+            else if (connector->num_peers == 0)
+            {
+                // no -d: the input spool goes to whoever connected (master behaviour)
+                int n = spool_load_any(connector);
+                fprintf(stderr, "Session with %s: %d message(s) queued.\n",
+                        connector->session_peer[0] ? connector->session_peer : "unknown station", n);
+            }
             else
             {
                 fprintf(stderr, "Session with %s (not a configured peer): receive only.\n",
@@ -550,6 +557,12 @@ void *vara_control_worker_thread_tx(void *conn)
                 int n = spool_load_peer(connector, idx);
                 if (n > 0)
                     fprintf(stderr, "Session with %s: %d more message(s) queued.\n", connector->peers[idx], n);
+            }
+            else if (connector->session_kind == SESSION_PEER && connector->num_peers == 0)
+            {
+                int n = spool_load_any(connector);
+                if (n > 0)
+                    fprintf(stderr, "Session: %d more message(s) queued.\n", n);
             }
             else if (connector->session_kind == SESSION_GUEST)
             {
