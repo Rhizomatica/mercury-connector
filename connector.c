@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -115,6 +116,10 @@ bool initialize_connector(rhizo_conn *connector){
     connector->serial_path[0] = 0;
     connector->connected = false;
     connector->waiting_for_connection = false;
+    connector->incoming_pending = false;
+    connector->pending_since = 0;
+    connector->channel_busy_until = 0;
+    srand((unsigned) time(NULL) ^ (unsigned) getpid());
     connector->serial_keying = false;
     connector->radio_type = -1;
     connector->tcp_ret_ok = true;
@@ -125,6 +130,66 @@ bool initialize_connector(rhizo_conn *connector){
     connector->timeout = TIMEOUT_DEFAULT;
     connector->ofdm_mode = true;
     connector->buffer_size = 0;
+
+    connector->num_peers = 0;
+    connector->next_peer = 0;
+    connector->retry_backoff = RETRY_BACKOFF_DEFAULT;
+    connector->attempt_peer = -1;
+    connector->attempt_time = 0;
+    connector->session_peer[0] = 0;
+    connector->guests_enabled = false;
+    connector->session_kind = SESSION_PEER;
+    connector->guest_call[0] = 0;
+    connector->guest_msgs = 0;
+    connector->guest_echoes = 0;
+    pthread_mutex_init(&connector->echo_mutex, NULL);
+    connector->echo_pending = false;
+    connector->echo_gen = 0;
+    connector->echo_quote[0] = 0;
+    connector->snr_x10 = 0;
+    connector->snr_valid = false;
+    connector->bps = 0;
+    connector->events_path[0] = 0;
+    pthread_mutex_init(&connector->events_mutex, NULL);
+    connector->session_active = false;
+    connector->session_ready = false;
+    connector->tx_hold = true;
+    connector->tx_idle = false;
+    connector->rx_session_gen = 0;
+    for (int i = 0; i < MAX_PEERS; i++)
+        connector->peer_retry_after[i] = 0;
+    return true;
+}
+
+/* -d accepts one callsign or a comma separated list (CALL1,CALL2,...).
+ * The first one is the default peer (also used by ARDOP). */
+static bool parse_peers(rhizo_conn *connector, const char *list)
+{
+    char tmp[1024];
+    char *save = NULL;
+
+    snprintf(tmp, sizeof(tmp), "%s", list);
+    connector->num_peers = 0;
+
+    for (char *tok = strtok_r(tmp, ", ", &save); tok; tok = strtok_r(NULL, ", ", &save))
+    {
+        if (connector->num_peers >= MAX_PEERS)
+        {
+            fprintf(stderr, "Too many peers (max %d).\n", MAX_PEERS);
+            return false;
+        }
+        if (strlen(tok) >= sizeof(connector->peers[0]))
+        {
+            fprintf(stderr, "Callsign too long: %s\n", tok);
+            return false;
+        }
+        strcpy(connector->peers[connector->num_peers++], tok);
+    }
+
+    if (connector->num_peers == 0)
+        return false;
+
+    strcpy(connector->remote_call_sign, connector->peers[0]);
     return true;
 }
 
@@ -164,7 +229,16 @@ int main (int argc, char *argv[])
         fprintf(stderr, " -i input_spool_directory    Input spool directory (Messages to send).\n");
         fprintf(stderr, " -o output_spool_directory    Output spool directory (Received messages).\n");
         fprintf(stderr, " -c callsign                        Station Callsign (Eg: PU2HFF).\n");
-        fprintf(stderr, " -d remote_callsign           Remote Station Callsign.\n");
+        fprintf(stderr, " -d remote_callsign[,call2,...] Remote Station Callsign(s). With several, outgoing mail goes in\n");
+        fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/; files in input_spool_directory\n");
+        fprintf(stderr, "                               itself go to the first one (VARA/Mercury only). Optional: without\n");
+        fprintf(stderr, "                               it nothing is called and the spool goes to whoever connects.\n");
+        fprintf(stderr, " -w retry_wait                Seconds before calling a station again after a failed call or\n");
+        fprintf(stderr, "                               finished session (default %d).\n", RETRY_BACKOFF_DEFAULT);
+        fprintf(stderr, " -g                           Guest mode (VARA/Mercury): any station may connect for an echo\n");
+        fprintf(stderr, "                               test or a short message; replies for a guest go in\n");
+        fprintf(stderr, "                               input_spool_directory/<CALLSIGN>/ and are sent when it calls.\n");
+        fprintf(stderr, " -e events_file               Append link/guest events as JSON lines (for a status page).\n");
         fprintf(stderr, " -a tnc_ip_address            IP address of the TNC,\n");
         fprintf(stderr, " -p tcp_base_port              TCP base port of the TNC. For VARA and ARDOP ports tcp_base_port and tcp_base_port+1 are used,\n");
         fprintf(stderr, " -t timeout                 Time to wait before disconnect when idling.\n");
@@ -180,7 +254,7 @@ int main (int argc, char *argv[])
 
     char *last;
     int opt;
-    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:l")) != -1)
+    while ((opt = getopt(argc, argv, "hr:si:o:c:d:p:a:t:f:s:x:m:lw:ge:")) != -1)
     {
         switch (opt)
         {
@@ -195,7 +269,22 @@ int main (int argc, char *argv[])
             strcpy(connector.call_sign, optarg);
             break;
         case 'd':
-            strcpy(connector.remote_call_sign, optarg);
+            if (!parse_peers(&connector, optarg))
+            {
+                fprintf(stderr, "Invalid -d remote callsign list: %s\n", optarg);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case 'g':
+            connector.guests_enabled = true;
+            break;
+        case 'e':
+            snprintf(connector.events_path, sizeof(connector.events_path), "%s", optarg);
+            break;
+        case 'w':
+            connector.retry_backoff = atoi(optarg);
+            if (connector.retry_backoff < 0)
+                connector.retry_backoff = 0;
             break;
         case 't':
             connector.timeout = atoi(optarg);
@@ -244,6 +333,12 @@ int main (int argc, char *argv[])
             goto manual;
         }
     }
+
+    // -d is optional, as on master: without it the connector never calls
+    // out, and (VARA/Mercury) anything in the input spool goes to whichever
+    // station connects
+    if (connector.num_peers == 0)
+        fprintf(stderr, "No remote callsign (-d): not calling out; the input spool goes to any station that connects.\n");
 
     if (connector.radio_type != -1)
         connector.serial_keying = true;
@@ -349,7 +444,21 @@ connector_start:
 
     pthread_t tid[3];
 
-    pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
+    if (!strcmp("ardop", connector.modem_type))
+    {
+        // ARDOP keeps the original single-peer spool: load on arrival, send
+        // to whoever is connected
+        pthread_create(&tid[0], NULL, spool_input_directory_thread, (void *) &connector);
+    }
+    else
+    {
+        // VARA/Mercury: per-peer spool, mail loaded only once the session's
+        // remote station is known (see vara.c)
+        if (!spool_create_peer_dirs(&connector))
+            fprintf(stderr, "Warning: some peer spool directories could not be created.\n");
+        if (connector.guests_enabled)
+            fprintf(stderr, "Guest mode on: any station may connect for an echo test or a short message.\n");
+    }
     pthread_create(&tid[1], NULL, spool_output_directory_thread, (void *) &connector);
 
     // pthread_create(&tid[2], NULL, modem_thread, (void *) &connector);

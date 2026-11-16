@@ -41,9 +41,32 @@ extern "C" {
 
 #define BUFFER_SIZE 8192
 
+// how many ".N" names spool_store tries before giving up on a name
+#define SPOOL_MAX_NAME_SUFFIX 1000
+
+// spool_store() results
+#define SPOOL_FAILED 0
+#define SPOOL_STORED 1
+#define SPOOL_DUPLICATE 2
+
+int spool_store(rhizo_conn *connector, const char *name, const uint8_t *data, size_t len,
+                char *stored_name, size_t stored_name_size);
+
 void *spool_output_directory_thread(void *conn);
 void *spool_input_directory_thread(void *conn);
 bool queue_msg_path(char *msg_path, rhizo_conn *connector);
 bool remove_all_msg_path_queue(rhizo_conn *connector);
+struct stat;
+void spool_skip_file(const char *path, const struct stat *st);
+
+// multi-peer spool routines
+int find_peer(rhizo_conn *connector, const char *call_sign);
+bool spool_create_peer_dirs(rhizo_conn *connector);
+bool spool_peer_has_mail(rhizo_conn *connector, int peer_idx);
+int spool_load_peer(rhizo_conn *connector, int peer_idx);
+void spool_reset_tx(rhizo_conn *connector);
+int spool_load_call(rhizo_conn *connector, const char *call_sign);
+bool spool_any_has_mail(rhizo_conn *connector);
+int spool_load_any(rhizo_conn *connector);
 
 #endif /* HAVE_SPOOL__ */
