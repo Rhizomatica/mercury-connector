@@ -54,6 +54,35 @@
 #include "radio_io.h"
 #include "guest.h"
 
+/* Session state changes (CONNECTED, DISCONNECTED, teardown, the end of
+ * setup) happen on two threads: the control rx thread sees the modem's
+ * lines, the control tx thread does the work that needs the data tx thread
+ * parked. This lock keeps them from interleaving, e.g. a teardown clearing
+ * session_active right after a new CONNECTED set it. */
+static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Bookkeeping for a session that is over: back off the peer, log, write
+ * link_down. Does not touch the transmit ring (the caller, or the next
+ * session setup, resets that with tx parked). Call with session_lock held. */
+static void session_end_bookkeeping(rhizo_conn *connector, const char *how)
+{
+    time_t now = time(NULL);
+    size_t pending = connector->msg_path_queue_size;
+    int idx = find_peer(connector, connector->session_peer);
+
+    if (idx >= 0)
+        connector->peer_retry_after[idx] = now + connector->retry_backoff;
+
+    fprintf(stderr, "Session with %s ended%s (%zu unacknowledged message(s) kept for retry).\n",
+            connector->session_peer[0] ? connector->session_peer : "unknown", how, pending);
+    guest_event_link(connector, false);
+
+    connector->session_peer[0] = 0;
+    connector->session_ready = false;
+    connector->attempt_peer = -1;
+    connector->session_active = false;
+}
+
 void *vara_data_worker_thread_tx(void *conn)
 {
     rhizo_conn *connector = (rhizo_conn *) conn;
@@ -338,11 +367,13 @@ void *vara_control_worker_thread_rx(void *conn)
             if (!strcmp((char *) buffer, "DISCONNECTED"))
             {
                 fprintf(stderr, "TNC: %s\n", buffer);
+                pthread_mutex_lock(&session_lock);
                 connector->incoming_pending = false;
                 connector->tx_hold = true;        // park tx before anything else
                 connector->rx_session_gen++;      // abandon any partial rx frame
                 connector->connected = false;
                 connector->waiting_for_connection = false;
+                pthread_mutex_unlock(&session_lock);
             }
             else
             {
@@ -363,7 +394,22 @@ void *vara_control_worker_thread_rx(void *conn)
 
                     fprintf(stderr, "TNC: %s\n", buffer);
 
+                    pthread_mutex_lock(&session_lock);
                     connector->tx_hold = true;   // nothing goes out until this peer's mail is loaded
+
+                    // The previous session dropped and this one came up
+                    // before the 1 Hz teardown ran (or there was no
+                    // DISCONNECTED at all): finish its bookkeeping now, so it
+                    // still gets its link_down and back-off. Its unsent bytes
+                    // are dropped by this session's setup.
+                    if (connector->session_active)
+                        session_end_bookkeeping(connector, " (new session started before teardown)");
+
+                    // A late answer to a CONNECT we already gave up on (or
+                    // an inbound call racing ours) is just a session with
+                    // whoever is named here; attempt_peer is not involved.
+                    connector->attempt_peer = -1;
+
                     connector->session_ready = false;
                     snprintf(connector->session_peer, sizeof(connector->session_peer), "%s",
                              peer ? peer : "");
@@ -381,6 +427,7 @@ void *vara_control_worker_thread_rx(void *conn)
                     connector->rx_session_gen++;   // frames must start in this session
                     connector->connected = true;
                     connector->waiting_for_connection = false;
+                    pthread_mutex_unlock(&session_lock);
                 }
                 else if (!strcmp((char *) buffer, "PENDING"))
                 {
@@ -491,29 +538,19 @@ void *vara_control_worker_thread_tx(void *conn)
         // Session teardown: the link is gone. Once the data tx thread is
         // parked, drop whatever was not handed to the modem (files are kept
         // and retried next session with the right station).
+        pthread_mutex_lock(&session_lock);
         if (connector->session_active && !connector->connected && connector->tx_idle)
         {
-            size_t pending = connector->msg_path_queue_size;
-            int idx = find_peer(connector, connector->session_peer);
-
             spool_reset_tx(connector);
-            if (idx >= 0)
-                connector->peer_retry_after[idx] = now + connector->retry_backoff;
-
-            fprintf(stderr, "Session with %s ended (%zu unacknowledged message(s) kept for retry).\n",
-                    connector->session_peer[0] ? connector->session_peer : "unknown", pending);
-            guest_event_link(connector, false);
-
-            connector->session_peer[0] = 0;
-            connector->session_ready = false;
-            connector->attempt_peer = -1;
-            connector->session_active = false;
+            session_end_bookkeeping(connector, "");
         }
+        pthread_mutex_unlock(&session_lock);
 
         // Session setup: load ONLY this station's mail, then release tx.
         if (connector->session_active && connector->connected &&
             !connector->session_ready && connector->tx_idle)
         {
+            unsigned setup_gen = connector->rx_session_gen;
             int idx = find_peer(connector, connector->session_peer);
 
             spool_reset_tx(connector);   // never carry bytes over from another session
@@ -544,9 +581,17 @@ void *vara_control_worker_thread_tx(void *conn)
                 fprintf(stderr, "Session with %s (not a configured peer): receive only.\n",
                         connector->session_peer[0] ? connector->session_peer : "unknown station");
             }
-            connector->attempt_peer = -1;
-            connector->session_ready = true;
-            connector->tx_hold = false;
+            // Release tx only if this is still the session we loaded mail
+            // for; if it dropped or another started meanwhile, the next tick
+            // tears down or sets up again (and resets the ring first).
+            pthread_mutex_lock(&session_lock);
+            if (connector->rx_session_gen == setup_gen && connector->connected)
+            {
+                connector->attempt_peer = -1;
+                connector->session_ready = true;
+                connector->tx_hold = false;
+            }
+            pthread_mutex_unlock(&session_lock);
         }
         // Mid-session: pick up mail for this station that arrived after setup.
         else if (connector->session_active && connector->connected && connector->session_ready)
@@ -580,6 +625,13 @@ void *vara_control_worker_thread_tx(void *conn)
             if (!connector->waiting_for_connection ||
                 now - connector->attempt_time > CONNECT_ATTEMPT_MAX_S)
             {
+                if (connector->waiting_for_connection)
+                {
+                    // the modem may still be calling: tell it to stop, or it
+                    // keeps transmitting and may connect long after we gave up
+                    fprintf(stderr, "No answer to our call after %d s: aborting it.\n", CONNECT_ATTEMPT_MAX_S);
+                    connector->tcp_ret_ok &= tcp_write(connector->control_socket, (uint8_t *) "ABORT\r", 6);
+                }
                 // random extra wait, so two stations that keep calling each
                 // other at the same moment drift apart instead of clashing again
                 int wait = connector->retry_backoff + rand() % (connector->retry_backoff / 4 + 1);

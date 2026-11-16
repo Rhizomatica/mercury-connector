@@ -52,8 +52,10 @@ extern "C" {
 #define MAX_PEERS 16
 // seconds to wait before calling a peer again after a failed attempt or a finished session
 #define RETRY_BACKOFF_DEFAULT 120
-// give up on an outbound CONNECT the modem never answered
+// give up on an outbound CONNECT the modem never answered (and ABORT it)
+#ifndef CONNECT_ATTEMPT_MAX_S
 #define CONNECT_ATTEMPT_MAX_S 300
+#endif
 // ignore spool files modified more recently than this (still being written)
 #define SPOOL_SETTLE_S 2
 // largest frame (filename + payload) accepted from the air; anything bigger
