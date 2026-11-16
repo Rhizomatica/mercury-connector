@@ -77,12 +77,75 @@ bool queue_msg_path(char *msg_path, rhizo_conn *connector){
 
 }
 
+/* Files we must not keep picking up: unreadable, too big to send, or sent
+ * but impossible to delete. Remembered by path + size + mtime, so a file
+ * that is fixed or replaced is tried again; otherwise it is ignored (and
+ * logged once) instead of being retried every second and making us call the
+ * peer over and over for mail we can never deliver. In memory only: after a
+ * restart each is tried once more. */
+#define SPOOL_SKIP_MAX 256
+static struct {
+    char path[1024];
+    off_t size;
+    time_t mtime;
+    bool used;
+} spool_skip[SPOOL_SKIP_MAX];
+static int spool_skip_next;
+static pthread_mutex_t spool_skip_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void spool_skip_file(const char *path, const struct stat *st)
+{
+    struct stat now;
+    if (st == NULL){
+        if (stat(path, &now) != 0)
+            return;                     // gone: nothing to skip
+        st = &now;
+    }
+    pthread_mutex_lock(&spool_skip_mutex);
+    int slot = -1;
+    for (int i = 0; i < SPOOL_SKIP_MAX; i++){
+        if (spool_skip[i].used && !strcmp(spool_skip[i].path, path)){
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0){
+        slot = spool_skip_next;
+        spool_skip_next = (spool_skip_next + 1) % SPOOL_SKIP_MAX;
+    }
+    snprintf(spool_skip[slot].path, sizeof(spool_skip[slot].path), "%s", path);
+    spool_skip[slot].size = st->st_size;
+    spool_skip[slot].mtime = st->st_mtime;
+    spool_skip[slot].used = true;
+    pthread_mutex_unlock(&spool_skip_mutex);
+}
+
+static bool spool_is_skipped(const char *path, const struct stat *st)
+{
+    bool skipped = false;
+    pthread_mutex_lock(&spool_skip_mutex);
+    for (int i = 0; i < SPOOL_SKIP_MAX; i++){
+        if (spool_skip[i].used && !strcmp(spool_skip[i].path, path)){
+            if (spool_skip[i].size == st->st_size && spool_skip[i].mtime == st->st_mtime)
+                skipped = true;
+            else
+                spool_skip[i].used = false;     // changed since: give it another go
+            break;
+        }
+    }
+    pthread_mutex_unlock(&spool_skip_mutex);
+    return skipped;
+}
+
 bool remove_all_msg_path_queue(rhizo_conn *connector){
     pthread_mutex_lock(&connector->msg_path_queue_mutex);
 
     for(int i = 0; i < connector->msg_path_queue_size; i++){
-        if (unlink(connector->msg_path_queue[i]) != 0){
-            fprintf(stderr, "File %s could not be deleted!\n", connector->msg_path_queue[i]);
+        if (unlink(connector->msg_path_queue[i]) != 0 && errno != ENOENT){
+            // delivered, but still here: don't send it again every session
+            fprintf(stderr, "File %s was sent but could not be deleted (%s): it will not be sent again until it changes.\n",
+                    connector->msg_path_queue[i], strerror(errno));
+            spool_skip_file(connector->msg_path_queue[i], NULL);
         }
         free(connector->msg_path_queue[i]);
     }
@@ -127,8 +190,9 @@ bool write_message_to_buffer(char *msg_path, rhizo_conn *connector){
     uint64_t frame_len = (uint64_t) name_len + (uint64_t) st.st_size;
 
     if (frame_len > MAX_RX_MSG_SIZE){
-        fprintf(stderr, "%s is too big to send (%lld bytes, limit %u): skipped.\n",
+        fprintf(stderr, "%s is too big to send (%lld bytes, limit %u): skipped until it changes.\n",
                 msg_path, (long long) st.st_size, MAX_RX_MSG_SIZE - (unsigned) name_len);
+        spool_skip_file(msg_path, &st);
         return false;
     }
 
@@ -145,8 +209,9 @@ bool write_message_to_buffer(char *msg_path, rhizo_conn *connector){
 
     FILE *f_in = fopen(msg_path, "r");
     if (f_in == NULL){
-        fprintf(stderr, "write_message_to_buffer: Message %s could not be opened (%s).\n",
+        fprintf(stderr, "write_message_to_buffer: Message %s could not be opened (%s), skipped until it changes.\n",
                 msg_path, strerror(errno));
+        spool_skip_file(msg_path, &st);
         free(frame);
         return false;
     }
@@ -540,6 +605,21 @@ static int scan_dir(rhizo_conn *connector, const char *dir, bool load)
             continue;
         if (path_is_queued(connector, path))  // already in the buffer this session
             continue;
+        if (spool_is_skipped(path, &st))      // known bad, unchanged since
+            continue;
+        if (access(path, R_OK) != 0)
+        {
+            fprintf(stderr, "%s is not readable (%s): skipped until it changes.\n", path, strerror(errno));
+            spool_skip_file(path, &st);
+            continue;
+        }
+        if ((uint64_t) st.st_size + strlen(dp->d_name) + 1 > MAX_RX_MSG_SIZE)
+        {
+            fprintf(stderr, "%s is too big to send (%lld bytes, limit about %u): skipped until it changes.\n",
+                    path, (long long) st.st_size, MAX_RX_MSG_SIZE);
+            spool_skip_file(path, &st);
+            continue;
+        }
 
         if (!load)
         {

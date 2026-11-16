@@ -56,6 +56,8 @@ void *spool_output_directory_thread(void *conn);
 void *spool_input_directory_thread(void *conn);
 bool queue_msg_path(char *msg_path, rhizo_conn *connector);
 bool remove_all_msg_path_queue(rhizo_conn *connector);
+struct stat;
+void spool_skip_file(const char *path, const struct stat *st);
 
 // multi-peer spool routines
 int find_peer(rhizo_conn *connector, const char *call_sign);
