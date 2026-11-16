@@ -64,10 +64,9 @@ static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Bookkeeping for a session that is over: back off the peer, log, write
  * link_down. Does not touch the transmit ring (the caller, or the next
  * session setup, resets that with tx parked). Call with session_lock held. */
-static void session_end_bookkeeping(rhizo_conn *connector, const char *how)
+static void session_end_bookkeeping(rhizo_conn *connector, const char *how, size_t pending)
 {
     time_t now = time(NULL);
-    size_t pending = connector->msg_path_queue_size;
     int idx = find_peer(connector, connector->session_peer);
 
     if (idx >= 0)
@@ -524,7 +523,8 @@ void *vara_control_worker_thread_rx(void *conn)
                     // still gets its link_down and back-off. Its unsent bytes
                     // are dropped by this session's setup.
                     if (connector->session_active)
-                        session_end_bookkeeping(connector, " (new session started before teardown)");
+                        session_end_bookkeeping(connector, " (new session started before teardown)",
+                                                connector->msg_path_queue_size);
 
                     // A late answer to a CONNECT we already gave up on (or
                     // an inbound call racing ours) is just a session with
@@ -662,8 +662,9 @@ void *vara_control_worker_thread_tx(void *conn)
         pthread_mutex_lock(&session_lock);
         if (connector->session_active && !connector->connected && connector->tx_idle)
         {
+            size_t pending = connector->msg_path_queue_size;   // before the reset clears it
             spool_reset_tx(connector);
-            session_end_bookkeeping(connector, "");
+            session_end_bookkeeping(connector, "", pending);
         }
         pthread_mutex_unlock(&session_lock);
 
