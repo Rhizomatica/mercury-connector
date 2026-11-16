@@ -143,6 +143,7 @@ static void rx_set_safe(rhizo_conn *connector, bool *safe, bool want)
  * stale, give a just-starting session a short grace period, and leave the
  * bytes alone if one shows up. */
 #define RX_NEW_SESSION_GRACE_MS 1000
+#define RX_GRACE_STEP_MS 50
 
 static void rx_discard_pending(rhizo_conn *connector, bool idle)
 {
@@ -156,11 +157,11 @@ static void rx_discard_pending(rhizo_conn *connector, bool idle)
 
     if (idle)
     {
-        for (int waited = 0; waited < RX_NEW_SESSION_GRACE_MS; waited += 50)
+        for (int waited = 0; waited < RX_NEW_SESSION_GRACE_MS; waited += RX_GRACE_STEP_MS)
         {
             if (connector->connected || connector->rx_session_gen != gen0)
                 return;                 // a session just started: these bytes are its
-            usleep(50 * 1000);
+            usleep(RX_GRACE_STEP_MS * 1000);
         }
     }
 
@@ -387,7 +388,7 @@ void *vara_control_worker_thread_rx(void *conn)
                     // answering. Starting our own CONNECT now would cancel
                     // that handshake and both stations would then call each
                     // other and miss -- so hold our own calls until this
-                    // resolves (CONNECTED, CANCELPENDING, or 30 s).
+                    // resolves (CONNECTED, CANCELPENDING, or PENDING_TIMEOUT_S).
                     fprintf(stderr, "%s\n", buffer);
                     connector->pending_since = (long) time(NULL);
                     connector->incoming_pending = true;
@@ -398,7 +399,7 @@ void *vara_control_worker_thread_rx(void *conn)
                     connector->incoming_pending = false;
                     // the other station may still be retrying: give it a
                     // random head start before we call out ourselves
-                    connector->channel_busy_until = (long) time(NULL) + 15 + rand() % 30;
+                    connector->channel_busy_until = (long) time(NULL) + CHANNEL_BUSY_MIN_S + rand() % CHANNEL_BUSY_JITTER_S;
                 }
                 else
                 {
@@ -578,8 +579,8 @@ void *vara_control_worker_thread_tx(void *conn)
         }
 
         // A PENDING that never resolved (no CONNECTED/CANCELPENDING): stop
-        // waiting for it after 30 s.
-        if (connector->incoming_pending && now - (time_t) connector->pending_since > 30)
+        // waiting for it after PENDING_TIMEOUT_S.
+        if (connector->incoming_pending && now - (time_t) connector->pending_since > PENDING_TIMEOUT_S)
             connector->incoming_pending = false;
 
         // Logic to start a connection: idle, nobody calling us right now,

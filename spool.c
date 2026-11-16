@@ -61,6 +61,12 @@ bool queue_msg_path(char *msg_path, rhizo_conn *connector){
 
     pthread_mutex_lock(&connector->msg_path_queue_mutex);
 
+    if (connector->msg_path_queue_size >= MSG_PATH_QUEUE_MAX){
+        pthread_mutex_unlock(&connector->msg_path_queue_mutex);
+        fprintf(stderr, "Message queue full, %s not queued.\n", msg_path);
+        return false;
+    }
+
     connector->msg_path_queue[connector->msg_path_queue_size] = (char *) malloc(strlen(msg_path)+1);
     strcpy(connector->msg_path_queue[connector->msg_path_queue_size], msg_path);
     connector->msg_path_queue_size++;
@@ -94,6 +100,12 @@ bool write_message_to_buffer(char *msg_path, rhizo_conn *connector){
     FILE *f_in;
     uint32_t msg_size;
     uint32_t msg_path_size = 0;
+
+    // every frame we send must be tracked, or it can't be deleted on BUFFER 0
+    if (connector->msg_path_queue_size >= MSG_PATH_QUEUE_MAX){
+        fprintf(stderr, "Message queue full, %s will be sent later.\n", msg_path);
+        return false;
+    }
 
     f_in = fopen(msg_path,"r");
     if (f_in == NULL){
@@ -194,17 +206,70 @@ static bool file_has_content(const char *path, const uint8_t *data, size_t len)
     return same && off == len;
 }
 
+/* Store data[0..len) in the output spool as <name>. The file is written
+ * under a hidden temp directory first and then hard-linked into place, so
+ * readers of the spool never see a partially written file, and an existing
+ * file is never overwritten: an identical copy (a resend after a lost ack)
+ * is dropped, a different one gets a ".N" suffix. Used for normal received
+ * mail and for guest messages alike. On SPOOL_STORED, the name actually
+ * used is written to stored_name (if not NULL). */
+int spool_store(rhizo_conn *connector, const char *name, const uint8_t *data, size_t len,
+                char *stored_name, size_t stored_name_size)
+{
+    static atomic_ulong tmp_counter = 0;
+    char tmp_path[1400], final_path[1400];
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.rx-tmp/%s.%ld.%lu", connector->output_directory, name,
+             (long) getpid(), (unsigned long) tmp_counter++);
+
+    FILE *fp = fopen(tmp_path, "w");
+    if (fp == NULL){
+        fprintf(stderr, "spool_store: %s could not be opened (%s).\n", tmp_path, strerror(errno));
+        return SPOOL_FAILED;
+    }
+    bool ok = fwrite(data, 1, len, fp) == len;
+    ok &= fflush(fp) == 0;
+    ok &= fsync(fileno(fp)) == 0;
+    ok &= fclose(fp) == 0;
+    if (!ok){
+        fprintf(stderr, "spool_store: error writing %s (%s).\n", tmp_path, strerror(errno));
+        unlink(tmp_path);
+        return SPOOL_FAILED;
+    }
+
+    // publish without ever overwriting: link() fails if the name exists
+    int result = SPOOL_FAILED;
+    for (int suffix = 0; suffix < SPOOL_MAX_NAME_SUFFIX; suffix++){
+        if (suffix == 0)
+            snprintf(final_path, sizeof(final_path), "%s%s", connector->output_directory, name);
+        else
+            snprintf(final_path, sizeof(final_path), "%s%s.%d", connector->output_directory, name, suffix);
+
+        if (link(tmp_path, final_path) == 0){
+            result = SPOOL_STORED;
+            if (stored_name != NULL)
+                snprintf(stored_name, stored_name_size, "%s", basename(final_path));
+            break;
+        }
+        if (errno != EEXIST){
+            fprintf(stderr, "spool_store: could not store %s (%s).\n", final_path, strerror(errno));
+            break;
+        }
+        if (file_has_content(final_path, data, len)){
+            result = SPOOL_DUPLICATE;
+            break;
+        }
+    }
+    unlink(tmp_path);
+    return result;
+}
+
 /* Read one COMPLETE frame (4-byte length, "filename\n", payload) from the
- * out buffer and store it in the output spool. The file is written under a
- * hidden temp directory first and then hard-linked into place, so readers
- * of the spool never see a partially written file, and an existing file is
- * never overwritten: an identical copy (a resend after a lost ack) is
- * dropped, a different one gets a ".N" suffix. */
+ * out buffer and store it in the output spool (see spool_store). */
 bool read_message_from_buffer(rhizo_conn *connector){
     uint32_t frame_size = 0;
     char name[MAX_RX_NAME_LEN + 1];
-    char tmp_path[1400], final_path[1400];
-    static unsigned long tmp_counter = 0;
+    char stored[MAX_RX_NAME_LEN + 16];
 
     read_buffer(&connector->out_buffer, (uint8_t *) &frame_size, sizeof(frame_size));
     if (frame_size == 0)
@@ -246,52 +311,13 @@ bool read_message_from_buffer(rhizo_conn *connector){
         payload_len = frame_size;
     }
 
-    snprintf(tmp_path, sizeof(tmp_path), "%s.rx-tmp/%s.%ld.%lu", connector->output_directory, name,
-             (long) getpid(), tmp_counter++);
-
-    FILE *fp = fopen(tmp_path, "w");
-    if (fp == NULL){
-        fprintf(stderr, "read_message_from_buffer: %s could not be opened (%s).\n", tmp_path, strerror(errno));
-        free(frame);
-        return false;
-    }
-    bool ok = fwrite(payload, 1, payload_len, fp) == payload_len;
-    ok &= fflush(fp) == 0;
-    ok &= fsync(fileno(fp)) == 0;
-    ok &= fclose(fp) == 0;
-    if (!ok){
-        fprintf(stderr, "read_message_from_buffer: error writing %s (%s).\n", tmp_path, strerror(errno));
-        unlink(tmp_path);
-        free(frame);
-        return false;
-    }
-
-    // publish without ever overwriting: link() fails if the name exists
-    bool stored = false;
-    for (int suffix = 0; suffix < 1000 && !stored; suffix++){
-        if (suffix == 0)
-            snprintf(final_path, sizeof(final_path), "%s%s", connector->output_directory, name);
-        else
-            snprintf(final_path, sizeof(final_path), "%s%s.%d", connector->output_directory, name, suffix);
-
-        if (link(tmp_path, final_path) == 0){
-            stored = true;
-            fprintf(stderr, "Incoming message %s with payload size %zu.\n", basename(final_path), payload_len);
-        }
-        else if (errno == EEXIST){
-            if (file_has_content(final_path, payload, payload_len)){
-                fprintf(stderr, "Incoming message %s is a duplicate of one already received, dropped.\n", name);
-                break;
-            }
-        }
-        else{
-            fprintf(stderr, "read_message_from_buffer: could not store %s (%s).\n", final_path, strerror(errno));
-            break;
-        }
-    }
-    unlink(tmp_path);
+    int r = spool_store(connector, name, payload, payload_len, stored, sizeof(stored));
+    if (r == SPOOL_STORED)
+        fprintf(stderr, "Incoming message %s with payload size %zu.\n", stored, payload_len);
+    else if (r == SPOOL_DUPLICATE)
+        fprintf(stderr, "Incoming message %s is a duplicate of one already received, dropped.\n", name);
     free(frame);
-    return stored;
+    return r == SPOOL_STORED;
 }
 
 void *spool_output_directory_thread(void *conn)
@@ -497,7 +523,7 @@ static int scan_dir(rhizo_conn *connector, const char *dir, bool load)
             break;
         }
 
-        if (connector->msg_path_queue_size >= 4000)
+        if (connector->msg_path_queue_size >= MSG_PATH_QUEUE_MAX)
         {
             fprintf(stderr, "Message queue full, remaining files will be sent next session.\n");
             break;

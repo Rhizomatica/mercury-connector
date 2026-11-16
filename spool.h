@@ -41,6 +41,17 @@ extern "C" {
 
 #define BUFFER_SIZE 8192
 
+// how many ".N" names spool_store tries before giving up on a name
+#define SPOOL_MAX_NAME_SUFFIX 1000
+
+// spool_store() results
+#define SPOOL_FAILED 0
+#define SPOOL_STORED 1
+#define SPOOL_DUPLICATE 2
+
+int spool_store(rhizo_conn *connector, const char *name, const uint8_t *data, size_t len,
+                char *stored_name, size_t stored_name_size);
+
 void *spool_output_directory_thread(void *conn);
 void *spool_input_directory_thread(void *conn);
 bool queue_msg_path(char *msg_path, rhizo_conn *connector);

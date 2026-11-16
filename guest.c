@@ -188,43 +188,33 @@ void guest_event_link(rhizo_conn *connector, bool up)
 static bool store_guest_message(rhizo_conn *connector, const char *body)
 {
     static unsigned long counter = 0;
-    char stamp[32], name[96], tmp_path[1400], final_path[1400];
+    char stamp[32], name[96], stored[128];
+    char text[GUEST_MAX_MSG + 128];
     time_t now = time(NULL);
     struct tm tm;
 
     gmtime_r(&now, &tm);
     strftime(stamp, sizeof(stamp), "%Y%m%dT%H%M%SZ", &tm);
     snprintf(name, sizeof(name), "guest_%s_%s_%lu.txt", connector->guest_call, stamp, counter++);
-    snprintf(tmp_path, sizeof(tmp_path), "%s.rx-tmp/%s.%ld", connector->output_directory, name, (long) getpid());
 
-    FILE *fp = fopen(tmp_path, "w");
-    if (fp == NULL)
-    {
-        fprintf(stderr, "Guest: could not write %s (%s).\n", tmp_path, strerror(errno));
-        return false;
-    }
     // the header is ours, never the guest's
-    bool ok = fprintf(fp, "type: report\ncallsign: %s\ncategory: status\nguest: yes\n\n%s\n",
-                      connector->guest_call, body) > 0;
-    ok &= fflush(fp) == 0;
-    ok &= fsync(fileno(fp)) == 0;
-    ok &= fclose(fp) == 0;
+    int len = snprintf(text, sizeof(text), "type: report\ncallsign: %s\ncategory: status\nguest: yes\n\n%s\n",
+                       connector->guest_call, body);
+    if (len < 0 || (size_t) len >= sizeof(text))
+        len = (int) strlen(text);
 
-    snprintf(final_path, sizeof(final_path), "%s%s", connector->output_directory, name);
-    if (ok && link(tmp_path, final_path) != 0)
-    {
-        fprintf(stderr, "Guest: could not store %s (%s).\n", final_path, strerror(errno));
-        ok = false;
-    }
-    unlink(tmp_path);
-    if (ok)
+    // same publishing as normal mail: temp file, fsync, link, ".N" on a clash
+    int r = spool_store(connector, name, (const uint8_t *) text, (size_t) len, stored, sizeof(stored));
+    if (r == SPOOL_FAILED)
+        return false;
+    if (r == SPOOL_STORED)
     {
         char fields[64];
-        fprintf(stderr, "Guest %s: message stored as %s.\n", connector->guest_call, name);
+        fprintf(stderr, "Guest %s: message stored as %s.\n", connector->guest_call, stored);
         snprintf(fields, sizeof(fields), "\"event\":\"message\",\"call\":\"%s\"", connector->guest_call);
         event_line(connector, fields);
     }
-    return ok;
+    return true;
 }
 
 void guest_handle_frame(rhizo_conn *connector, const uint8_t *frame, uint32_t size, unsigned gen)

@@ -61,6 +61,14 @@ extern "C" {
 #define MAX_RX_MSG_SIZE (16u * 1024u * 1024u)
 // longest filename written to the output spool
 #define MAX_RX_NAME_LEN 100
+// messages loaded into one session's transmit buffer (size of msg_path_queue)
+#define MSG_PATH_QUEUE_MAX 4096
+// stop waiting for a PENDING (incoming call) that never resolves
+#define PENDING_TIMEOUT_S 30
+// after CANCELPENDING, hold our own calls for MIN + rand() % JITTER seconds,
+// so the other station can retry first
+#define CHANNEL_BUSY_MIN_S 15
+#define CHANNEL_BUSY_JITTER_S 30
 
 typedef struct{
 // public
@@ -96,7 +104,7 @@ typedef struct{
     int data_socket;
     int control_socket;
     pthread_mutex_t msg_path_queue_mutex;
-    char *msg_path_queue[4096];
+    char *msg_path_queue[MSG_PATH_QUEUE_MAX];
     size_t msg_path_queue_size;
 
 // multi-peer (VARA/Mercury only; ARDOP keeps the legacy single-peer path)
